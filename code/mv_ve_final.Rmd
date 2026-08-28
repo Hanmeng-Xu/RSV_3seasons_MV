@@ -1,0 +1,822 @@
+---
+title: "Estimating the effectiveness of maternal vaccine using test-negative design"
+author: "Hanmeng Xu"
+date: "2026-08-15"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      message = FALSE)
+
+
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(reactable)
+library(ggplot2)
+library(stringr)
+library(flextable)
+library(zoo)
+library(cowplot)
+library(gtsummary) 
+library(gt)
+library(lubridate)
+library(openxlsx)
+library(rio)
+library(gganimate)
+library(splines)
+library(ggpubr)
+library(patchwork)
+
+source("../../season2_RSV_risk/code/analysis_code/utils_risk_2nd_season.R")
+
+savenewplot <- F
+```
+
+
+### Read in cleaned data 
+  * remove those whose abrysvo status we couldn't confirm due to delivery outside YNHHS 
+```{r}
+df.mv <- readRDS("../../season2_RSV_risk/data/cleaned/df.3seasons.rds") %>% as.data.frame() # 17755 
+
+# only included those <= 12 months at test 
+df.mv <- df.mv %>% filter(age_at_test_in_months <= 12) # 10489 (7266 removed)
+
+# remove those whose abrysvo status we couldn't confirm due to delivery outside YNHHS 
+df.mv <- df.mv %>% filter(!is.na(abrysvo_vaccinated_for_current_delivery)) # 6179 (4310 removed)
+
+df.mv <- df.mv %>% mutate(collection_week = floor_date(collection_date, "week"))
+```
+
+
+
+
+### define output path
+  * exposure definition in main analysis: strict (>= 14 days vax to birth) vs. broad
+  * adjustment for RSV seasonality: month_tested_factor vs. log_positivity_ext_c
+```{r}
+def_expo <- "relaxed"
+cf_seasonality <- "rsvactivity"
+table_op_folder <- paste0("VAXDEF_", def_expo)
+figure_op_folder <- paste0("VAXDEF_", def_expo, "; CF_", cf_seasonality)
+
+table_op_path <- paste0("../figs_tabs/tables/", table_op_folder)
+figure_op_path <- paste0("../figs_tabs/figures/", figure_op_folder)
+
+# create folder if not exist 
+if (!dir.exists(table_op_path)) {dir.create(table_op_path, recursive = TRUE)}
+if (!dir.exists(figure_op_path)) {dir.create(figure_op_path, recursive = TRUE)}
+```
+
+
+### external positivity rate (obtained from popHIVE for CT)
+  * Source: https://github.com/PopHIVE/Ingest/blob/main/data/epic_resp_infections/standard/weekly.csv.gz
+  * this is using data from EPIC 
+```{r}
+# 1-4Y from epic (via pophive)
+ df.posrate.ext <- readRDS("../data/external_rsv_activity/df.rsv.posrate.ext.pophive.1_4Y.epic.rds") 
+# df.posrate.ext <- readRDS("../data/external_rsv_activity/df.rsv.posrate.ext.pophive.allages.epic.rds") 
+
+# all ages from NSSP (via pophive)
+# df.posrate.ext <- readRDS("../../season2_RSV_risk/data/interfiles/df.rsv.posrate.ext.pophive.nssp.rds") 
+
+# join into the main dataset 
+df.mv <- df.mv %>% 
+  left_join(df.posrate.ext %>% dplyr::select(collection_week, log_positivity_ext, log_positivity_ext_c), by = "collection_week")
+
+
+# month tested 
+df.mv <- df.mv %>% 
+  mutate(month_tested = month(collection_date)) %>% 
+  mutate(month_tested_cat = case_when(month_tested %in% c(10,11,12,1,2,3) ~ "RSV season",
+                                      month_tested %in% c(4,5,6,7,8,9) ~ "Off season")) %>%
+  mutate(month_tested_factor = factor(month_tested)) %>% 
+  mutate(month_tested_factor_2m = case_when(month_tested %in% c(10,11) ~ "Oct-Nov",
+                                            month_tested %in% c(12,1) ~ "Dec-Jan",
+                                            month_tested %in% c(2,3) ~ "Feb-Mar",
+                                            month_tested %in% c(4,5,6,7,8,9) ~ "Off season months"))
+
+# age at RSV test
+summary(df.mv$age_at_test_in_months)
+
+# season of test
+df.mv <- df.mv %>% 
+  mutate(collection_season = case_when(collection_date >= as.Date("2023-7-1") & collection_date <= as.Date("2024-6-30") ~ "2023/24",
+                                       collection_date >= as.Date("2024-7-1") & collection_date <= as.Date("2025-6-30") ~ "2024/25",
+                                       collection_date >= as.Date("2025-7-1") & collection_date <= as.Date("2026-6-30") ~ "2025/26"
+                                       ))
+df.mv %>% count(collection_season) 
+```
+
+<br>
+
+### look at when abrysvo was given
+* note that the vaccination is still going on (for the first 2 seasons) until March
+```{r}
+df.mv %>% 
+  ggplot() +
+  geom_histogram(aes(abrysvo_date)) +
+  scale_x_date(date_breaks = "1 month", date_labels = "%m")
+```
+
+
+
+### Inclusion criteria (????)
+  * (current CDC's rec: Pregnant women should get a single dose of the maternal RSV vaccine (Pfizer’s Abrysvo) during weeks 32 through 36 of pregnancy sometime between September through January.) 
+```{r}
+nrow(df.mv)  # 6179
+
+
+# 1. Eligible for the vaccine: birth date restriction
+df.mv.eligible <- df.mv %>% 
+  filter( (babydob >= as.Date("2023-9-1") & babydob <= as.Date("2024-4-30")) |
+            (babydob >= as.Date("2024-9-1") & babydob <= as.Date("2025-4-30")) |
+            (babydob >= as.Date("2025-9-1") & babydob <= as.Date("2026-4-30"))) %>%
+  # suggested by Carlos: as MV vaccination stops in YNHHS from October 2025, remove those born after this date
+  filter(babydob < as.Date("2025-10-1")) 
+
+nrow(df.mv.eligible) # 3981
+
+
+# 2. Eligible for the vaccine: GA restriction
+# also remove those having gestation < 32 weeks, thus are not eligible for maternal vaccine
+df.mv.eligible <- df.mv.eligible %>% filter(gestage >= 32) # 3798
+
+
+
+df.mv %>% count(abrysvo_vaccinated_for_current_delivery) # 682 MV vaccinated before applying eligibility criteria
+df.mv.eligible %>% count(abrysvo_vaccinated_for_current_delivery, positive_rsv) # 644 MV vaccinated  
+
+
+
+df.mv <- df.mv.eligible 
+nrow(df.mv) # 3798
+
+```
+
+
+
+
+#### create a dataset removing the duplicates records 
+  * keep positive test if any exists
+  * else, keep the first negative test within 14 days
+```{r }
+min_test_interval <- 14
+
+df.mv <- df.mv %>%
+  arrange(babystudyid, collection_date) %>%
+  group_by(babystudyid) %>%
+  mutate(
+    group_id = {
+      group <- integer(n())
+      g <- 1L
+      ref_date <- collection_date[1]
+      group[1] <- g
+      if (n() > 1) {
+        for (i in 2:n()) {
+          if (as.numeric(collection_date[i] - ref_date) > min_test_interval) {
+            g <- g + 1L
+            ref_date <- collection_date[i]
+          }
+          group[i] <- g
+        }
+      }
+      group
+    }
+  ) %>%
+  group_by(babystudyid, group_id) %>%
+  mutate(
+    keep = case_when(
+      any(positive_rsv == 1) ~ positive_rsv == 1,  # keep positive if any exist
+      TRUE                   ~ row_number() == 1    # else keep earliest
+    ),
+    remove = !keep
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-group_id, -keep)
+
+df.mv%>% count(remove) # 332 to be removed 
+df.mv%>% count(remove, positive_rsv) 
+df.mv %>% count(remove, positive_rsv, abrysvo_vaccinated_for_current_delivery) 
+
+
+df.mv <- df.mv %>% filter(remove == FALSE )
+nrow(df.mv)
+df.mv %>% count(abrysvo_vaccinated_for_current_delivery, positive_rsv) # there is no vaccinated case removed.
+
+```
+
+
+### check duplicate records after removing the duplicates 
+```{r eval = F}
+df.mv %>% count(babystudyid)  %>% arrange(desc(n))
+df.mv %>% filter(babystudyid == "7362662") %>% dplyr::select(collection_date, positive_rsv)
+```
+
+
+
+
+#### classify the exposure 
+  * nirsevimab only
+  * MV only: vaccinated at least 14 days before delivery date
+  * both 
+  * unimmunized
+```{r}
+# time since nirsevimab immunization to test 
+df.mv <- df.mv %>%
+  mutate(nir_to_test_in_days = ifelse(nir_vaccinated_bf_test == 1, as.numeric(collection_date - nir_date), NA)) %>% 
+  mutate(nir_to_test_in_days_cat = case_when(nir_to_test_in_days >= 0 & nir_to_test_in_days < 30 * 6 ~ "mAb: < 6m", 
+                                             nir_to_test_in_days >= 30 * 6 ~ "mAb: >= 6m" )) %>% 
+  mutate(nir_to_test_in_days_cat = ifelse(is.na(nir_to_test_in_days_cat), "mAb: unimmunized", nir_to_test_in_days_cat))
+
+df.mv %>% count(nir_to_test_in_days_cat)
+
+#########################################################################
+# first define "abrysvo-vaccinated": any vaccination before delivery (relaxed)
+#########################################################################
+df.mv <- df.mv %>% 
+  mutate(abrysvo_vaccinated_for_current_delivery_14daysmore = 
+           ifelse(abrysvo_vaccinated_for_current_delivery == 1 & abrysvo_to_dob >= 14, 1, 0))
+df.mv %>% count(abrysvo_vaccinated_for_current_delivery_14daysmore) # 576 vaccinated
+df.mv %>% count(abrysvo_vaccinated_for_current_delivery) # 580 vaccinated 
+
+# unstratified (by age at test) exposure 
+df.mv <- df.mv %>%
+  mutate(exp_mv_mab_unstrat = case_when(nir_vaccinated_bf_test == 1 & abrysvo_vaccinated_for_current_delivery == 1 ~ "Both MV and mAb",
+                                        nir_vaccinated_bf_test == 1 & abrysvo_vaccinated_for_current_delivery == 0 ~ "mAb only",
+                                        nir_vaccinated_bf_test == 0 & abrysvo_vaccinated_for_current_delivery == 1 ~ "MV only",
+                                        nir_vaccinated_bf_test == 0 & abrysvo_vaccinated_for_current_delivery == 0 ~ "Unimmunized")) %>%
+  mutate(exp_mv_mab_unstrat = factor(exp_mv_mab_unstrat, levels = c("Unimmunized", "MV only", "mAb only", "Both MV and mAb")))
+
+
+df.mv %>% count(exp_mv_mab_unstrat, positive_rsv)
+
+```
+
+
+
+
+### for numbers in the participants flowchart
+```{r}
+df.mv %>% filter(positive_rsv == 1) %>% count(exp_mv_mab_unstrat)
+df.mv %>% filter(positive_rsv == 0) %>% count(exp_mv_mab_unstrat)
+```
+
+
+
+#### the final analytic population
+```{r}
+nrow(df.mv) # 3466
+```
+
+<br>
+
+
+#### Plot the test and vax over time
+As all the infants are under 1 yo, we can just simply classify them into one of the four exposure group:
+  * mv only, nir only, both, unimmunized
+```{r, fig.height=8, fig.width=7}
+plt.test <- 
+  df.mv %>% 
+  mutate(exp_mv_mab_unstrat = case_when(exp_mv_mab_unstrat == "MV only" ~ "RSVpreF only",
+                                        exp_mv_mab_unstrat == "mAb only" ~ "Nirsevimab only",
+                                        exp_mv_mab_unstrat == "Both MV and mAb" ~ "Both RSVpreF and nirsevimab",
+                                        TRUE ~ exp_mv_mab_unstrat)) %>%
+  ggplot() + 
+  geom_histogram(aes(x = collection_date, fill = exp_mv_mab_unstrat), binwidth = 20) +
+  theme_classic() +
+  theme(legend.position =  "top",
+        axis.text.x = element_text(size = 8)) +
+  scale_fill_manual(values = c("RSVpreF only" = "steelblue1",
+                               "Nirsevimab only" = "lightgoldenrod",
+                               "Both RSVpreF and nirsevimab" = "plum1",
+                               "Unimmunized" = "grey"
+                               )) +
+  scale_x_date(date_breaks = "2 month", date_labels = "%y-%m", limits = as.Date(c("2023-10-1", "2026-3-1"))) +
+  guides(fill = guide_legend(ncol = 2, nrow = 2, title = "RSV product received")) +
+  xlab("Time of RSV test") 
+  
+  
+# Time of nirsevimab
+plt.nir <- df.mv %>% 
+  filter(nir_vaccinated_bf_test == 1) %>%
+  ggplot() + 
+  geom_histogram(aes(x = nir_date), fill = "lightgoldenrod", binwidth = 20) +
+  scale_x_date(date_breaks = "2 month", date_labels = "%y-%m", limits = as.Date(c("2023-10-1", "2026-3-1"))) +
+  xlab("Time of nirsevimab immunization") +
+  theme_classic() +
+   theme(axis.text.x = element_text(size = 8)) +
+  ylim(c(0,180))
+
+# time of MV
+plt.mv <- df.mv %>% 
+  filter(abrysvo_vaccinated_for_current_delivery == 1) %>%
+  ggplot() + 
+  geom_histogram(aes(x = abrysvo_date), fill = "steelblue1", binwidth = 20) +
+  scale_x_date(date_breaks = "2 month", date_labels = "%y-%m", limits = as.Date(c("2023-10-1", "2026-3-1"))) +
+  xlab("Time of RSVpreF vaccination") +
+  theme_classic() +
+  theme(axis.text.x = element_text(size = 8)) +
+  ylim(c(0,180))
+
+  
+# combine plots 
+margin_fix <- theme(plot.margin = margin(t = 5, r = 10, b = 5, l = 10))  # increase l
+plt.overview <- 
+  ggarrange(plt.test + margin_fix,
+          plt.nir + margin_fix,
+          plt.mv + margin_fix,
+          labels = c("A.", "B.","C."),
+          ncol = 1, 
+          heights = c(2,1,1))
+
+plt.overview
+
+# ggsave(plt.overview, filename = paste0(figure_op_path, "/case_overview.pdf"), width = 7, height = 8)
+```
+
+
+
+
+
+### Table 1 {.tabset}
+
+#### RSV+ vs. RSV-
+```{r}
+df.table1.casecontrol <- df.mv %>% 
+  mutate(hosp_admitted_relevant = ifelse(is.na(hosp_admitted_relevant), 0,1)) %>%
+  dplyr::select(positive_rsv, sex, race_ethnicity, age_at_test_in_months,
+                collection_season, 
+                #month_tested_cat,
+                month_tested_factor_2m,
+                gestage, birthwt, insurance_type, 
+                hosp_admitted_relevant, icu_admitted_relevant, 
+                rf_preterm, rf_cardiac, rf_atleastone, 
+                # nir_vaccinated_bf_test, 
+                # abrysvo_vaccinated_for_current_delivery
+                exp_mv_mab_unstrat
+                ) %>% 
+  mutate(positive_rsv = case_when(positive_rsv == 1 ~ "Cases", 
+                                  positive_rsv == 0 ~ "Controls")) %>% 
+  mutate(race_ethnicity = factor(race_ethnicity, levels = c("Black non-Hispanic",
+                                                            "White non-Hispanic",
+                                                            "Other non-Hispanic",
+                                                            "Hispanic", "unknown")))
+  # mutate(across(c(rf_preterm, gestage, birthwt, abrysvo_vaccinated_for_current_delivery), ~ factor(.) %>% forcats::fct_explicit_na()))
+
+# footnotes 
+footnote_otherraces <- "Including American Indian or Native American, Asian, Middle Eastern or Northern African, and Pacific Islander by self-reporting."
+footnote_atleastoneriskfactor <- "Have at least 1 of the following conditions recorded in the infant’s medical history or diagnosis records: (1) asthma, (2) immunodeficiency (e.g., transplantation history or leukemia), (3) cardiac diseases (including congenital heart diseases diagnosed at birth or any reporting of heart conditions), (4) pulmonary diseases, (5) Down syndrome, (6) birth weight <2,500 g, and (7) prematurity (gestational age <37 weeks)."
+
+
+table1.casecontrol <- df.table1.casecontrol  %>% 
+  tbl_summary(by = positive_rsv,
+              
+              type = list(all_continuous() ~ "continuous2"),       # indicate that you want to print multiple statistics 
+         statistic = list(all_continuous() ~ c("{mean} ({sd})", 
+                                               "{median} ({p25}, {p75})",
+                                               "{N_miss} ({p_miss}%)"),                 
+                          all_categorical() ~ "{n} ({p}%)"),
+         
+              digits = list(all_categorical() ~ c(0, 1),
+                            all_continuous() ~ 1),
+         
+              label  = list(  
+                sex ~ "Sex", 
+                age_at_test_in_months ~ "Age at RSV test (months)",
+                race_ethnicity ~ "Race and ethnicity",
+                collection_season ~ "Season of test",
+                #month_tested_cat ~ "Month tested",
+                month_tested_factor_2m ~ "Month tested",
+                gestage ~ "Gestation",
+                birthwt ~ "Birth weight (g)",
+                insurance_type ~ "Insurance type",
+                hosp_admitted_relevant ~ "Hospitalized",
+                icu_admitted_relevant ~ "Admitted to PICU",
+                rf_preterm ~ "Preterm",
+                rf_cardiac ~ "Cardiac diseases", 
+                rf_atleastone ~ "Having at least one risk factor",
+                
+                # nir_vaccinated_bf_test ~ "Nirsevimab immunized",
+                # abrysvo_vaccinated_for_current_delivery ~ "Mom received abrysvo"
+                exp_mv_mab_unstrat ~ "RSV immunization"
+                ),
+         
+        missing_text = "Missing"
+        #,
+         #     percent = "row"
+        #      missing= "no"
+                      ) %>% 
+  add_difference(everything() ~ "smd") %>% # note that here we calculated smd between means.
+  # add_p(pvalue_fun = ~ style_pvalue(., digits = 3)) %>% 
+  add_overall(last = F) %>%
+  bold_labels() %>%
+  modify_table_styling(
+    columns = label,
+    rows = label == "Other non-Hispanic",
+    footnote = footnote_otherraces
+                 ) %>%
+  modify_table_styling(
+    columns = label,
+    rows = label == "Having at least one risk factor",
+    footnote = footnote_atleastoneriskfactor
+  )
+  
+
+
+table1.casecontrol %>% as_flex_table() %>% 
+  flextable::set_table_properties( width = 1, layout = "autofit") 
+  
+if(savenewplot){
+  table1.casecontrol %>%
+    as_gt() %>%
+    gt::gtsave(filename = paste0(table_op_path, "/table1_casecontrol.docx"))
+}
+```
+
+
+#### Compare the characteristics of those who took both and vs who only took one of the two
+```{r}
+df.table1.vaxtype <- df.mv %>% 
+  mutate(hosp_admitted_relevant = ifelse(is.na(hosp_admitted_relevant), 0,1)) %>%
+  dplyr::select(sex, race_ethnicity, age_at_test_in_months,
+                collection_season, 
+                # month_tested_cat,
+                month_tested_factor_2m,
+                gestage, birthwt, insurance_type, 
+                hosp_admitted_relevant, icu_admitted_relevant, 
+                rf_preterm, rf_cardiac, rf_atleastone, 
+                # nir_vaccinated_bf_test, 
+                # abrysvo_vaccinated_for_current_delivery
+                exp_mv_mab_unstrat
+                ) %>% 
+  mutate(race_ethnicity = factor(race_ethnicity, levels = c("Black non-Hispanic",
+                                                            "White non-Hispanic",
+                                                            "Other non-Hispanic",
+                                                            "Hispanic", "unknown")))
+
+table1.vaxtype <- df.table1.vaxtype  %>% 
+  tbl_summary(by = exp_mv_mab_unstrat,
+              
+              type = list(all_continuous() ~ "continuous2"),       # indicate that you want to print multiple statistics 
+         statistic = list(all_continuous() ~ c("{mean} ({sd})", 
+                                               "{median} ({p25}, {p75})",
+                                               "{N_miss} ({p_miss}%)"),                 
+                          all_categorical() ~ "{n} ({p}%)"),
+         
+              digits = list(all_categorical() ~ c(0, 1),
+                            all_continuous() ~ 1),
+         
+              label  = list(  
+                sex ~ "Sex", 
+                age_at_test_in_months ~ "Age at RSV test (months)",
+                race_ethnicity ~ "Race and ethnicity",
+                collection_season ~ "Season of test",
+                # month_tested_cat ~ "Month tested",
+                month_tested_factor_2m ~ "Month tested",
+                gestage ~ "Gestation",
+                birthwt ~ "Birth weight (g)",
+                insurance_type ~ "Insurance type",
+                hosp_admitted_relevant ~ "Hospitalized",
+                icu_admitted_relevant ~ "Admitted to PICU",
+                rf_preterm ~ "Preterm",
+                rf_cardiac ~ "Cardiac diseases", 
+                rf_atleastone ~ "Having at least one risk factor"
+                # nir_vaccinated_bf_test ~ "Nirsevimab immunized",
+                # abrysvo_vaccinated_for_current_delivery ~ "Mom received abrysvo"
+               
+                ),
+         
+        missing_text = "Missing"
+        #,
+         #     percent = "row"
+        #      missing= "no"
+                      ) %>% 
+  add_p(pvalue_fun = ~ style_pvalue(., digits = 3)) %>% 
+  add_overall(last = F) %>%
+  bold_labels() %>%
+  modify_table_styling(
+    columns = label,
+    rows = label == "Other non-Hispanic",
+    footnote = footnote_otherraces
+                 ) %>%
+  modify_table_styling(
+    columns = label,
+    rows = label == "Having at least one risk factor",
+    footnote = footnote_atleastoneriskfactor
+  )
+  
+
+
+table1.vaxtype %>% as_flex_table() %>% 
+  flextable::set_table_properties( width = 1, layout = "autofit") 
+  
+if(savenewplot){
+  table1.vaxtype %>%
+    as_gt() %>%
+    gt::gtsave(filename = paste0(table_op_path, "/table1_vaxtype.docx"))
+}
+
+```
+
+<br>
+
+
+### Estimate effectiveness of maternal RSVpreF vaccine and nirsevimab
+
+#### Define confounders 
+```{r}
+# all the imbalanced variables btw cases vs. controls
+cf.mv <- c("age_at_test_in_months", # continuous (although exposure has been stratified by age)
+           "month_tested_factor",
+            "log_positivity_ext_c",  # adjusting for this widern CI and lower the point estimates
+            "rf_atleastone",
+            "birthwt",  # unbalanced btw cases and controls
+            "gestage"
+            # "rf_cardiac" # unbalanced btw cases and controls
+           ) 
+```
+
+<br>
+
+### Stratify the analytic population into 
+  * age at test < 6 months
+  * age at test 7-12 months
+  * age at test < 3 months
+```{r}
+df.mv.under6m <- df.mv %>% filter(age_at_test_in_months < 6) # 2073 
+df.mv.above6m <- df.mv %>% filter(age_at_test_in_months >= 6) # 1725
+df.mv.under3m <- df.mv %>% filter(age_at_test_in_months < 3) # 1209
+
+# df.mv.under6m %>% filter(hosp_admitted_relevant ==1) %>%count(positive_rsv, exp_mv_mab_unstrat)
+```
+
+### VE among under 6 months
+```{r, warning=F}
+# ------------------------------------------------------------------------------
+# against RSV infection 
+# ------------------------------------------------------------------------------
+df.ve <- df.mv.under6m %>% mutate(case_control = positive_rsv) %>% as.data.frame()
+ve.infection.under6m <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+df.ve$age_at_test_in_months <- df.ve$age_at_test_in_months - mean(df.ve$age_at_test_in_months) # center
+ve.infection.under6m.addInt <- ve_unmatched_addInteraction(dta = df.ve, confounders = cf.mv, 
+                                                           exposure_var = "exp_mv_mab_unstrat", 
+                                                           indicator = "age_at_test_in_months") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+
+
+# ------------------------------------------------------------------------------
+# against hospitalization
+# ------------------------------------------------------------------------------
+df.ve <- df.mv.under6m %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_control = positive_rsv) %>% as.data.frame()
+ve.hosp.under6m <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+df.ve$age_at_test_in_months <- df.ve$age_at_test_in_months - mean(df.ve$age_at_test_in_months)
+ve.hosp.under6m.addInt <- ve_unmatched_addInteraction(dta = df.ve, confounders = cf.mv, 
+                                                      exposure_var = "exp_mv_mab_unstrat", 
+                                                      indicator = "age_at_test_in_months") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+
+ve.under6m <- rbind(ve.infection.under6m, ve.hosp.under6m) 
+ve.under6m.addInt <- rbind(ve.infection.under6m.addInt, ve.hosp.under6m.addInt) 
+```
+
+### VE among over 6 months
+```{r  warning=F}
+# ------------------------------------------------------------------------------
+# against RSV infection 
+# ------------------------------------------------------------------------------
+df.ve <- df.mv.above6m %>% mutate(case_control = positive_rsv) %>% as.data.frame()
+ve.infection.above6m <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+df.ve$age_at_test_in_months <- df.ve$age_at_test_in_months - mean(df.ve$age_at_test_in_months)
+ve.infection.above6m.addInt <- ve_unmatched_addInteraction(dta = df.ve, confounders = cf.mv, 
+                                                           exposure_var = "exp_mv_mab_unstrat",
+                                                           indicator = "age_at_test_in_months") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+
+
+# ------------------------------------------------------------------------------
+# against hospitalization
+# ------------------------------------------------------------------------------
+df.ve <- df.mv.above6m %>% filter(hosp_admitted_relevant==1) %>% mutate(case_control = positive_rsv) %>% as.data.frame()
+ve.hosp.above6m <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+df.ve$age_at_test_in_months <- df.ve$age_at_test_in_months - mean(df.ve$age_at_test_in_months)
+ve.hosp.above6m.addInt <- ve_unmatched_addInteraction(dta = df.ve, confounders = cf.mv, 
+                                       exposure_var = "exp_mv_mab_unstrat",
+                                        indicator = "age_at_test_in_months") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+
+ve.above6m <- rbind(ve.infection.above6m, ve.hosp.above6m) 
+ve.above6m.addInt <- rbind(ve.infection.above6m.addInt, ve.hosp.above6m.addInt) 
+
+```
+
+### VE among under 3 months
+```{r  warning=F}
+# ------------------------------------------------------------------------------
+# against RSV infection 
+# ------------------------------------------------------------------------------
+df.ve <- df.mv.under3m %>% mutate(case_control = positive_rsv) %>% as.data.frame()
+ve.infection.under3m <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+
+df.ve$age_at_test_in_months <- df.ve$age_at_test_in_months - mean(df.ve$age_at_test_in_months) # center
+ve.infection.under3m.addInt <- ve_unmatched_addInteraction(dta = df.ve, confounders = cf.mv, 
+                                                           exposure_var = "exp_mv_mab_unstrat", 
+                                                           indicator = "age_at_test_in_months") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+
+# ------------------------------------------------------------------------------
+# against hospitalization
+# ------------------------------------------------------------------------------
+df.ve <- df.mv.under3m %>% filter(hosp_admitted_relevant==1) %>% mutate(case_control = positive_rsv) %>% as.data.frame()
+ve.hosp.under3m <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+ve.under3m <- rbind(ve.infection.under3m, ve.hosp.under3m) 
+
+```
+
+
+
+<br>
+
+### plot VE forest plot
+```{r, fig.height = 3.5, fig.width = 9}
+plt.ve.mv.under6m <- ve_forest_MV(df.plot = ve.under6m %>% dplyr::rename(vax = exp_mv_mab_unstrat))
+plt.ve.mv.under6m 
+# ggsave(plt.ve.mv.under6m, filename = paste0(figure_op_path, "/ve_mv_under6m.pdf"), width = 9, height = 3.5)
+
+plt.ve.mv.under6m.addInt <- ve_forest_MV(df.plot = ve.under6m.addInt %>% dplyr::rename(vax = exp_mv_mab_unstrat))
+plt.ve.mv.under6m.addInt 
+
+plt.ve.mv.above6m <- ve_forest_MV(df.plot = ve.above6m %>% dplyr::rename(vax = exp_mv_mab_unstrat))
+plt.ve.mv.above6m
+# ggsave(plt.ve.mv.above6m, filename = paste0(figure_op_path, "/ve_mv_above6m.pdf"), width = 9, height = 3.5)
+
+
+plt.ve.mv.under3m <- ve_forest_MV(df.plot = ve.under3m %>% dplyr::rename(vax = exp_mv_mab_unstrat))
+plt.ve.mv.under3m 
+# ggsave(plt.ve.mv.under3m, filename = paste0(figure_op_path, "/ve_mv_under3m.pdf"), width = 9, height = 3.5)
+```
+
+
+### Combine all the above figures together (main results, but will put in supplement)
+```{r, fig.height = 10, fig.width = 9}
+headroom <- theme(plot.margin = margin(t = 10, r = 5, b = 5, l = 5))
+
+plt.ve.mv.nir.main <- plot_grid(
+  plt.ve.mv.under6m  & headroom,
+  plt.ve.mv.above6m  & headroom,
+  plt.ve.mv.under3m  & headroom,
+  labels = c("A) Effectiveness among infants aged < 6 months",
+             "B) Effectiveness among infants aged ≥ 6 months",
+             "C) Effectiveness among infants aged < 3 months"),
+  label_x = 0, hjust = 0, vjust = 1,
+  label_size = 11, label_fontface = "bold",
+  ncol = 1
+)
+
+plt.ve.mv.nir.main
+
+# ggsave(plt.ve.mv.nir.main, filename = paste0(figure_op_path, "/ve_mv_nir_main.pdf"), width = 9, height = 10)
+```
+
+
+
+
+
+### Sensitivity analysis {.tabset}
+
+#### Alternative definition for abrysvo 
+  * In the main analysis above, we used relaxed definition for RSVpreF vaccination, thus in the sensitivity analysis, we alternatively use a strict definition, requiring at least 14 days between RSVpreF vaccination and delivery
+```{r}
+# unstratified (by age at test) exposure 
+df.mv <- df.mv %>%
+  mutate(exp_mv_mab_unstrat_SAexp = case_when(nir_vaccinated_bf_test == 1 & abrysvo_vaccinated_for_current_delivery_14daysmore == 1 ~ "Both MV and mAb",
+                                        nir_vaccinated_bf_test == 1 & abrysvo_vaccinated_for_current_delivery_14daysmore == 0 ~ "mAb only",
+                                        nir_vaccinated_bf_test == 0 & abrysvo_vaccinated_for_current_delivery_14daysmore == 1 ~ "MV only",
+                                        nir_vaccinated_bf_test == 0 & abrysvo_vaccinated_for_current_delivery_14daysmore == 0 ~ "Unimmunized")) %>%
+  mutate(exp_mv_mab_unstrat_SAexp = factor(exp_mv_mab_unstrat_SAexp, levels = c("Unimmunized", "MV only", "mAb only", "Both MV and mAb")))
+
+
+df.mv.under6m <- df.mv %>% filter(age_at_test_in_months < 6) # 2073 
+df.mv.above6m <- df.mv %>% filter(age_at_test_in_months >= 6) # 1725
+df.mv.under3m <- df.mv %>% filter(age_at_test_in_months < 3) # 1209
+
+```
+
+
+# repeat the above analysis for different age group
+```{r}
+# ------------------------------------------------------------------------------
+# under 6 months
+# ------------------------------------------------------------------------------
+# against infection
+df.ve <- df.mv.under6m %>% mutate(case_control = positive_rsv)
+ve.infection.under6m.SAexp <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat_SAexp") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+
+# against hospitalization
+df.ve <- df.mv.under6m %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_control = positive_rsv)
+ve.hosp.under6m.SAexp <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat_SAexp") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+ve.under6m.SAexp <- rbind(ve.infection.under6m.SAexp, ve.hosp.under6m.SAexp) 
+
+
+# ------------------------------------------------------------------------------
+# above 6 months
+# ------------------------------------------------------------------------------
+# against infection
+df.ve <- df.mv.above6m %>% mutate(case_control = positive_rsv)
+ve.infection.above6m.SAexp <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat_SAexp") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+
+# against hospitalization
+df.ve <- df.mv.above6m %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_control = positive_rsv)
+ve.hosp.above6m.SAexp <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat_SAexp") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+ve.above6m.SAexp <- rbind(ve.infection.above6m.SAexp, ve.hosp.above6m.SAexp) 
+
+
+# ------------------------------------------------------------------------------
+# under 3 months
+# ------------------------------------------------------------------------------
+# against infection
+df.ve <- df.mv.under3m %>% mutate(case_control = positive_rsv)
+ve.infection.under3m.SAexp <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat_SAexp") %>% 
+  mutate(against = "Medically attended RSV infection")
+
+
+# against hospitalization
+df.ve <- df.mv.under3m %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_control = positive_rsv)
+ve.hosp.under3m.SAexp <- ve_unmatched(dta = df.ve, confounders = cf.mv, exposure_var = "exp_mv_mab_unstrat_SAexp") %>% 
+  mutate(against = "RSV-associated hospitalization")
+
+ve.under3m.SAexp <- rbind(ve.infection.under3m.SAexp, ve.hosp.under3m.SAexp)
+```
+
+
+### plot the sensitivity analysis using alternative vaccination definition (relaxed definition)
+```{r, fig.height = 3.5, fig.width = 9}
+plt.ve.mv.under6m.SAexp <- ve_forest_MV(df.plot = ve.under6m.SAexp %>% dplyr::rename(vax = exp_mv_mab_unstrat_SAexp))
+plt.ve.mv.under6m.SAexp 
+# ggsave(plt.ve.mv.under6m.SAexp, filename = paste0(figure_op_path, "/ve_mv_under6m_SAexp.pdf"), width = 9, height = 3.5)
+
+plt.ve.mv.above6m.SAexp <- ve_forest_MV(df.plot = ve.above6m.SAexp %>% dplyr::rename(vax = exp_mv_mab_unstrat_SAexp))
+plt.ve.mv.above6m.SAexp
+# ggsave(plt.ve.mv.above6m.SAexp, filename = paste0(figure_op_path, "/ve_mv_above6m_SAexp.pdf"), width = 9, height = 3.5)
+
+
+plt.ve.mv.under3m.SAexp <- ve_forest_MV(df.plot = ve.under3m.SAexp %>% dplyr::rename(vax = exp_mv_mab_unstrat_SAexp))
+plt.ve.mv.under3m.SAexp 
+# ggsave(plt.ve.mv.under3m.SAexp, filename = paste0(figure_op_path, "/ve_mv_under3m_SAexp.pdf"), width = 9, height = 3.5)
+```
+
+
+### Combine all the above figures together (sensitivity analysis results, but will put in supplement)
+```{r, fig.height = 10, fig.width = 9}
+headroom <- theme(plot.margin = margin(t = 10, r = 5, b = 5, l = 5))
+
+plt.ve.mv.nir.SAexpo <- plot_grid(
+  plt.ve.mv.under6m.SAexp  & headroom,
+  plt.ve.mv.above6m.SAexp  & headroom,
+  plt.ve.mv.under3m.SAexp  & headroom,
+  labels = c("A) Effectiveness among infants aged < 6 months",
+             "B) Effectiveness among infants aged ≥ 6 months",
+             "C) Effectiveness among infants aged < 3 months"),
+  label_x = 0, hjust = 0, vjust = 1,
+  label_size = 11, label_fontface = "bold",
+  ncol = 1
+)
+
+plt.ve.mv.nir.SAexpo
+
+# ggsave(plt.ve.mv.nir.SAexpo, filename = paste0(figure_op_path, "/ve_mv_nir_SAexpo.pdf"), width = 9, height = 10)
+```
+
+
+
+

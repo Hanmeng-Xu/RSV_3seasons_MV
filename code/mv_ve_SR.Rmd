@@ -1,0 +1,215 @@
+---
+title: "Summarize MV VE from literature"
+author: "Hanmeng Xu"
+date: "2025-08-20"
+output: html_document
+---
+
+This script summarizes the vaccine effectiveness of maternal RSV vaccine efficacy / effectiveness.
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,
+                      warning = FALSE,
+                      message = FALSE)
+
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(reactable)
+library(ggplot2)
+library(stringr)
+library(flextable)
+library(lubridate)
+library(MASS)
+library(smd)
+library(haven)
+library(zoo)
+library(cowplot)
+library(gtsummary) # for table 1
+library(gt)
+library(officer)
+library(corrplot)
+library(survival)
+library(splines)
+library(patchwork)
+
+source("../../season2_RSV_risk/code/analysis_code/utils_risk_2nd_season.R")
+
+saveoutput <- F
+```
+
+
+```{r}
+# read MV VE data from file
+df.lit <- read_excel("../data/SR/MV_VE_SR.xlsx") 
+
+
+### select which exposure definition to use
+df.lit <- df.lit %>% filter(studyid != "Current study" | 
+                              (studyid == "Current study" & note_2 == "relaxed definition"))
+
+# select the data to show for Williams et al, 2025 (use their primary outcome using the 14 days exposure definition)
+df.lit <- df.lit %>% filter(studyid != "Williams et al, 2025" | 
+                              (studyid == "Williams et al, 2025" & note_2 == "select"))
+
+# select data to show for Kampmann et al. 2023 (keep only age group under 3 and under 6, removing under 4/5)
+df.lit <- df.lit %>% filter(studyid != "Kampmann et al. 2023" | 
+                              (studyid == "Kampmann et al. 2023" & note_2 == "select"))
+
+# remove the VE in McLachlan et al. 2025 for preterm infants
+df.lit <- df.lit %>% filter(studyid != "McLachlan et al. 2025" | 
+                              (studyid == "McLachlan et al. 2025" & note_2 == "select"))
+
+
+
+df.lit <- df.lit %>% dplyr::select(-c(title, url, ga_range_week, nirsevimab, note_1, note_2))
+```
+
+### select the data we want to include from current study:
+  * age range: under 6m OR (this has CI crosses 0) 
+  * age range: under 3m (this has most CIs > 0), maybe use this??? but the sample size is too low
+```{r}
+# select age range 
+# df.lit <- df.lit %>%
+#   filter(studyid != "Current study" | age_ub_month == 6)
+
+# delete those from the ACIP report as they are repetitive results as the pulished paper (Moline et al. 2026)
+df.lit <- df.lit %>% 
+  filter(studyid != "VISION (CDC)" & studyid != "NVSN (CDC)")
+```
+
+```{r}
+# classify the outcomes
+df.lit <- df.lit %>% 
+  mutate(outcome_cat = case_when(outcome %in% c("RSV-associated LRTI",
+                                                "MA RSV LRTI",
+                                                "RSV-associated RTI",
+                                                "RSV-associated ARI") ~ "MA RSV infection",
+                                 outcome %in% c("RSV-associated severe LRTI", 
+                                                "MA severe RSV LRTI",
+                                                "RSV-associated ALRI requiring high-flow nasal cannula support") ~ "severe MA RSV infection",
+                                 outcome %in% c("RSV-associated outpatient visit") ~ "RSV-associated outpatient visit",
+                                 outcome %in% c("RSV-associated hospitalization",
+                                                "RSV hospitalization",
+                                                "RSV-associated LRTD leading to hospitalization",
+                                                "RSV-associated ALRI leading to hospitalization",
+                                                "RSV-associated LRTI hospitalization",
+                                                "RSV-associated LRTI hospitalization (preterm)",
+                                                "RSV-associated LRTI hospitalization (sub-optimal)"
+                                                ) ~ "RSV-associated hospitalization",
+                                 outcome %in% c("RSV-associated severe LRTD leading to hospitalization",
+                                                "RSV-associated ALRI requiring high-flow nasal cannula support",
+                                                "RSV-associated ALRI PICU admission"
+                                                ) ~ "severe RSV-associated hospitalization"))
+
+# remove several estimates (the one that used sub-optimal vax definition, 0-14 days from vac to birth)
+df.lit <- df.lit %>% filter(outcome != "RSV-associated LRTI hospitalization (sub-optimal)")
+
+# collection time range 
+df.lit <- df.lit %>% 
+  mutate(time_range = paste0(year(dta_collect_start),".", month(dta_collect_start), "-", year(dta_collect_end),".", month(dta_collect_end))) %>%
+  mutate(studyid = str_replace(studyid, " et al. ", " ")) %>% 
+  mutate(studyid = ifelse(str_detect(outcome, "preterm"), paste0(studyid, " (preterm)"), studyid)) %>%
+  mutate(outcome = str_replace(outcome, " \\(preterm\\)", ""))
+
+# create median(lb-ub) column
+df.lit <- df.lit %>% 
+  mutate(ve = paste0(ve_median, " (", ve_lb, ", ", ve_ub, ")"))
+
+# shorten the outcome column a bit 
+df.lit <- df.lit %>%
+  mutate(outcome = str_replace(outcome, " leading to ", " ")) %>%
+  mutate(outcome = str_replace(outcome, "high-flow nasal cannula", "HFNC")) %>%
+  mutate(outcome = str_replace(outcome, "-associated", "")) %>%
+  mutate(outcome = str_replace(outcome, "^(.*)\\bsevere\\b(.*)$", "severe \\1\\2")) %>%
+  mutate(outcome = str_replace(outcome, " {2,}", " ")) %>%
+  mutate(outcome = str_replace(outcome, " requiring ", " w/ "))
+
+# unknown age range 
+df.lit <- df.lit %>% 
+  mutate(age_ub_month = ifelse(age_ub_month == "?", "unknown", age_ub_month))
+
+# some small processing of outcome columns :
+df.lit <- df.lit %>% 
+  mutate(outcome = ifelse(outcome == "severe MA RSV LRTI", "severe RSV LRTI", outcome)) %>%
+  mutate(outcome = ifelse(outcome == "MA RSV LRTI", "RSV LRTI", outcome)) %>% 
+  mutate(outcome = ifelse(outcome == "severe RSV LRTD hospitalization", "severe RSV LRTI hospitalization", outcome))  %>%
+  mutate(outcome = ifelse(outcome == "RSV LRTD hospitalization", "RSV LRTI hospitalization", outcome)) 
+
+
+# format age to 0-x month format
+df.lit <- df.lit %>% 
+  mutate(age_ub_month = paste0("0-", age_ub_month, " months"))
+```
+
+```{r}
+# remove the collection date range as they are less important
+# df.lit <- df.lit %>% dplyr::select(-c(dta_collect_start, dta_collect_end))
+
+
+# only keep those under 6 months
+df.lit <- df.lit %>% filter(age_ub_month != "0-3 months")
+```
+
+
+
+```{r fig.height = 8, fig.width = 12}
+unique(df.lit$outcome_cat)
+
+df.infection <- df.lit %>% filter(outcome_cat == "MA RSV infection") %>% mutate(outcome_cat = "Medically attended RSV infection")
+df.severe.infection <- df.lit %>% filter(outcome_cat == "severe MA RSV infection")
+df.hosp <- df.lit %>% filter(outcome_cat == "RSV-associated hospitalization")
+df.severe.hosp <- df.lit %>% filter(outcome_cat == "severe RSV-associated hospitalization")
+names(df.infection)
+
+
+plt.ve.lit.infection <- plot_ve_sr(df.outcome = df.infection) # 10 estimates
+plt.ve.lit.severe.infection <- plot_ve_sr(df.outcome = df.severe.infection) # 6 estimates
+plt.ve.lit.hosp <- plot_ve_sr(df.outcome = df.hosp) # 14 estimates
+plt.ve.lit.severe.hosp <- plot_ve_sr(df.outcome = df.severe.hosp) # 2 estimates
+
+
+# combine all in one plot 
+plt.mv.ve.lit.all <- 
+  plot_grid(plt.ve.lit.infection, 
+            plt.ve.lit.severe.infection,
+            plt.ve.lit.hosp,
+            plt.ve.lit.severe.hosp,
+            ncol = 1, 
+            rel_heights = c(4, 3, 8, 3),
+            labels = c("A)", "B)", "C)", "D)")
+          )
+
+plt.mv.ve.lit.all
+
+if(saveoutput){
+  ggsave(plot = plt.mv.ve.lit.all, filename = "../figs_tabs/figures/mv.ve.lit.all.pdf", height = 8, width =12)
+}
+```
+
+<br>
+
+### Keep only "against infection" and "against hospitalization"
+```{r fig.width = 12, fig.height = 5}
+plt.mv.ve.lit.infection.hosp <- 
+  plot_grid(plt.ve.lit.infection, 
+            plt.ve.lit.hosp,
+            ncol = 1, 
+            rel_heights = c(6,  9),
+            labels = c("A)", "B)")
+          )
+
+plt.mv.ve.lit.infection.hosp
+
+if(saveoutput){
+  ggsave(plot = plt.mv.ve.lit.infection.hosp, filename = "../figs_tabs/figures/mv.ve.lit.infection.hosp.pdf", height = 5, width =12)
+}
+```
+
+
+
+
+

@@ -1,0 +1,3630 @@
+---
+title: "wane_sep_mv_nir"
+author: "Hanmeng Xu"
+date: "2026-07-15"
+output: html_document
+---
+
+This script estimates the waning VE for nirsevimab and maternal vaccine separately
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      warning = FALSE,
+                      message = FALSE)
+
+
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(readxl)
+library(writexl)
+library(reactable)
+library(ggplot2)
+library(stringr)
+library(flextable)
+library(zoo)
+library(cowplot)
+library(gtsummary) 
+library(gt)
+library(lubridate)
+library(openxlsx)
+library(rio)
+library(gganimate)
+library(splines)
+
+source("mod_wane_mv.R")
+source("../../season2_RSV_risk/code/analysis_code/utils_risk_2nd_season.R")
+
+
+set.seed(123)
+
+rerun <- F
+```
+
+### Read in cleaned data 
+```{r}
+df <- readRDS("../../season2_RSV_risk/data/cleaned/df.3seasons.rds") %>% as.data.frame()
+```
+
+
+
+### **Inclusion criteria**, exclude infants:
+  * those whom we can't ascertain the maternal vaccine status
+  * age <= 12 months
+  * didn't restrict to those eligible for MV (to increase sample size)
+```{r}
+df.wane <- df %>%
+  filter(!is.na(abrysvo_vaccinated_for_current_delivery)) %>% 
+  filter(age_at_test_in_months <= 12 )  # 6179
+
+# eligible for MV
+df.wane <- df.wane %>%
+   filter( (babydob >= as.Date("2023-9-1") & babydob <= as.Date("2024-4-30")) |
+            (babydob >= as.Date("2024-9-1") & babydob <= as.Date("2025-4-30")) |
+            (babydob >= as.Date("2025-9-1") & babydob <= as.Date("2026-4-30"))) %>%
+  filter(babydob < as.Date("2025-10-1"))
+
+# same as the main analysis, also remove those born before 32 weeks of gestation 
+df.wane <- df.wane %>% filter(gestage >= 32) 
+
+
+nrow(df.wane) 
+```
+
+
+### Define exposure:
+  * MV vaccinated: regardless of time since vax to birth.
+
+
+### Look at some variables 
+```{r}
+summary(df.wane$age_at_test_in_months)
+
+# time from abrysvo to birth 
+hist(df.wane$abrysvo_to_dob) # 1-80 days
+
+# time from birth to test (only for those MV immunized)
+df.wane <- df.wane %>%
+  mutate(birth_to_test_in_days = ifelse(abrysvo_vaccinated_for_current_delivery == 1, 
+                                        as.numeric(collection_date - babydob), NA))
+hist(df.wane$birth_to_test_in_days)
+
+
+# time from abrysvo to test 
+df.wane <- df.wane %>%
+  mutate(abrysvo_to_test_in_days = ifelse(abrysvo_vaccinated_for_current_delivery == 1, 
+                                          as.numeric(collection_date - abrysvo_date), NA))
+hist(df.wane$abrysvo_to_test_in_days)
+summary(df.wane$abrysvo_to_test_in_days)
+
+
+# time from nirsevimab to test 
+df.wane <- df.wane %>%
+  mutate(nir_to_test_in_days = ifelse(nir_vaccinated_bf_test == 1, 
+                                      as.numeric(collection_date - nir_date), NA))
+```
+
+
+### Confounders {.tabset}
+
+#### age at test 
+```{r}
+# ------------------------------------------------------------------------------
+# age at RSV test (categorical, 3-month interval)
+# ------------------------------------------------------------------------------
+summary(df.wane$age_at_test_in_months)
+hist(df.wane$age_at_test_in_months)
+
+df.wane$age_at_test_in_months_cat <- cut(df.wane$age_at_test_in_months, 
+                                         breaks = c(seq(0, 24, by = 3), Inf), 
+                                         labels = c(paste0(seq(0, 21, by = 3), "-", seq(3, 24, by = 3),"m"), "25m+"),
+                                         right  = TRUE, include.lowest = TRUE) 
+
+df.wane %>% count(age_at_test_in_months_cat) # max age = 37 months (should we also do this for under 1??)
+df.wane <- cbind(df.wane, model.matrix(~ age_at_test_in_months_cat - 1, data = df.wane))
+
+```
+
+#### calendar month tested: 
+```{r}
+# ------------------------------------------------------------------------------
+# calendar months when tested for RSV (off-season and rsv season)
+# ------------------------------------------------------------------------------
+df.wane <- df.wane %>%
+  mutate(month_tested = month(collection_date)) %>% 
+  mutate(month_tested_cat = case_when(month_tested %in% c(10,11,12,1,2,3) ~ "RSV season",
+                                      month_tested %in% c(4,5,6,7,8,9) ~ "Off season"))
+
+df.wane %>% count(month_tested_cat)
+df.wane <- cbind(df.wane, model.matrix(~ month_tested_cat - 1, data = df.wane))
+
+# df.wane %>% dplyr::select(month_tested_cat, `month_tested_catOff season`, `month_tested_catRSV season`)
+
+
+# ------------------------------------------------------------------------------
+# month tested
+# ------------------------------------------------------------------------------
+df.wane <- df.wane %>% 
+  mutate(month_tested_factor = factor(month_tested)) %>% 
+  mutate(month_tested_factor_2m = case_when(month_tested %in% c(10,11) ~ "Oct-Nov",
+                                            month_tested %in% c(12,1) ~ "Dec-Jan",
+                                            month_tested %in% c(2,3) ~ "Feb-Mar",
+                                            month_tested %in% c(4,5,6,7,8,9) ~ "other months")) %>%
+  mutate(month_sin = sin(2 * pi * month_tested / 12),
+         month_cos = cos(2 * pi * month_tested / 12))
+
+```
+
+
+#### Time since October
+  * Days from the latest past October. 
+```{r}
+df.wane <- df.wane %>%
+  mutate(
+    # Find the latest past October 1st relative to each date
+    oct1_same_year = as.Date(paste0(year(collection_date), "-10-01")),
+    oct1_prev_year = as.Date(paste0(year(collection_date) - 1, "-10-01")),
+    # If collection_date is before Oct 1 of same year, use previous year's Oct 1
+    last_oct1 = if_else(collection_date >= oct1_same_year, oct1_same_year, oct1_prev_year),
+    days_since_oct1 = as.numeric(collection_date - last_oct1)
+  ) %>% dplyr::select(-oct1_same_year, -oct1_prev_year) 
+
+df.wane %>% dplyr::select(collection_date, last_oct1, days_since_oct1)
+hist(df.wane$days_since_oct1)
+
+# (try) make harmonic terms from days_since_oct1
+df.wane <- df.wane %>% 
+  mutate(days_since_oct1_sin = sin(2 * pi * days_since_oct1 / 365),
+         days_since_oct1_cos = cos(2 * pi * days_since_oct1 / 365))
+```
+
+
+#### having at least one risk factor 
+```{r}
+# ------------------------------------------------------------------------------
+# risk factor (having at least one risk factor)
+# ------------------------------------------------------------------------------
+df.wane %>% count(rf_atleastone)
+```
+
+
+
+#### RSV incidence over time
+```{r}
+# ------------------------------------------------------------------------------
+# positivity rate from external
+# ------------------------------------------------------------------------------
+df.posrate.ext <- readRDS("../data/external_rsv_activity/df.rsv.posrate.ext.pophive.1_4Y.epic.rds")
+
+df.wane <- df.wane %>% 
+  mutate(collection_week = floor_date(collection_date, "week")) %>%
+  left_join(df.posrate.ext %>% dplyr::select(collection_week, log_positivity_ext, log_positivity_ext_c), 
+            by = "collection_week")
+```
+
+
+
+
+#### create a dataset removing the duplicates records 
+```{r }
+min_test_interval <- 14
+
+df.wane <- df.wane %>%
+  arrange(babystudyid, collection_date) %>%
+  group_by(babystudyid) %>%
+  mutate(
+    group_id = {
+      group <- integer(n())
+      g <- 1L
+      ref_date <- collection_date[1]
+      group[1] <- g
+      if (n() > 1) {
+        for (i in 2:n()) {
+          if (as.numeric(collection_date[i] - ref_date) > min_test_interval) {
+            g <- g + 1L
+            ref_date <- collection_date[i]
+          }
+          group[i] <- g
+        }
+      }
+      group
+    }
+  ) %>%
+  group_by(babystudyid, group_id) %>%
+  mutate(
+    keep = case_when(
+      any(positive_rsv == 1) ~ positive_rsv == 1,  # keep positive if any exist
+      TRUE                   ~ row_number() == 1    # else keep earliest
+    ),
+    remove = !keep
+  ) %>%
+  ungroup() %>%
+  dplyr::select(-group_id, -keep)
+
+df.wane%>% count(remove) # 332 to be removed 
+df.wane%>% count(remove, positive_rsv) 
+df.wane %>% count(remove, positive_rsv, abrysvo_vaccinated_for_current_delivery) 
+
+
+df.wane <- df.wane %>% filter(remove == FALSE )
+nrow(df.wane)
+```
+
+
+
+
+
+
+
+
+#### the final analytic population
+```{r}
+nrow(df.wane)
+```
+
+
+
+
+
+
+
+### Create exposure variables {.tabset}
+Mutually exclusive bins: nir only, MV only, both 
+
+#### Time from birth to test (age) for those abrysvo vaccinated individuals
+```{r}
+# ------------------------------------------------------------------
+# Step 1: Build mutually exclusive exposure strata
+# ------------------------------------------------------------------
+df.wane <- df.wane %>%
+  mutate(
+    mat_only = (abrysvo_vaccinated_for_current_delivery == 1) & (nir_vaccinated_bf_test == 0),
+    nir_only = (abrysvo_vaccinated_for_current_delivery == 0) & (nir_vaccinated_bf_test == 1),
+    both     = (abrysvo_vaccinated_for_current_delivery == 1) & (nir_vaccinated_bf_test == 1),
+    neither  = (abrysvo_vaccinated_for_current_delivery == 0) & (nir_vaccinated_bf_test == 0)
+  )
+
+stopifnot(sum(df.wane$mat_only + df.wane$nir_only + df.wane$both + df.wane$neither) == nrow(df.wane))
+
+# ------------------------------------------------------------------
+# Step 2: time since exposure (mat_only and nir_only only — "both" gets no time structure)
+# ------------------------------------------------------------------
+df.wane <- df.wane %>%
+  mutate(
+    time_since_exposure = case_when(
+      mat_only ~ birth_to_test_in_days,
+      nir_only ~ nir_to_test_in_days,
+      TRUE     ~ NA_real_
+    )
+  )
+
+# ------------------------------------------------------------------
+# Step 3: 30-day bins
+# ------------------------------------------------------------------
+max_days <- ceiling(max(df.wane$birth_to_test_in_days, df.wane$nir_to_test_in_days, na.rm = TRUE) / 30) * 30
+bin_breaks <- seq(0, max_days, by = 30)
+bin_labels <- paste0("d", head(bin_breaks, -1), "_", tail(bin_breaks, -1))
+
+df.wane <- df.wane %>%
+  mutate(
+    time_bin = cut(
+      time_since_exposure,
+      breaks = bin_breaks,
+      labels = bin_labels,
+      right = FALSE,
+      include.lowest = TRUE
+    )
+  )
+
+# ------------------------------------------------------------------
+# Step 4: Build design matrices
+# ------------------------------------------------------------------
+make_group_matrix <- function(df, stratum_flag, time_bin_var, bin_labels) {
+  mat <- matrix(0, nrow = nrow(df), ncol = length(bin_labels),
+                dimnames = list(NULL, bin_labels))
+  idx <- which(df[[stratum_flag]])
+  bins_for_idx <- as.character(df[[time_bin_var]][idx])
+  for (i in seq_along(idx)) {
+    b <- bins_for_idx[i]
+    if (!is.na(b)) mat[idx[i], b] <- 1
+  }
+  mat
+}
+
+drop_empty_cols <- function(mat) {
+  keep <- colSums(mat) > 0
+  mat[, keep, drop = FALSE]
+}
+
+mat_time_group <- drop_empty_cols(make_group_matrix(df.wane, "mat_only", "time_bin", bin_labels))
+nir_time_group <- drop_empty_cols(make_group_matrix(df.wane, "nir_only", "time_bin", bin_labels))
+
+N_mat_groups <- ncol(mat_time_group)
+N_nir_groups <- ncol(nir_time_group)
+
+# ------------------------------------------------------------------
+# "Both" stratum: constant indicator, no time structure
+# ------------------------------------------------------------------
+both_products <- as.numeric(df.wane$both)
+
+# ------------------------------------------------------------------
+# Sanity checks
+# ------------------------------------------------------------------
+print(sum(both_products))  # should equal 408
+
+# ------------------------------------------------------------------
+# Merge mat_time_group and nir_time_group into df.wane
+# ------------------------------------------------------------------
+
+# Rename columns with explicit prefixes before merging, to avoid
+# collisions with any other column names and to make subgroup
+# filtering/selecting easier later (e.g. select(starts_with("mat_bin_")))
+colnames(mat_time_group) <- paste0("mat_bin_", colnames(mat_time_group))
+colnames(nir_time_group) <- paste0("nir_bin_", colnames(nir_time_group))
+
+# Convert to data frames for binding
+mat_time_df <- as.data.frame(mat_time_group)
+nir_time_df <- as.data.frame(nir_time_group)
+
+# Bind by column position (row order is preserved from df.wane since
+# both matrices were built directly from df.wane's rows in order)
+df.wane <- bind_cols(df.wane, mat_time_df, nir_time_df)
+
+# Also merge the "both" indicator and the underlying strata flags,
+# since you'll likely want these for subgroup analysis too
+df.wane <- df.wane %>%
+  mutate(both_products = both_products)
+
+# ------------------------------------------------------------------
+# Sanity check: confirm row alignment didn't shift
+# ------------------------------------------------------------------
+stopifnot(nrow(df.wane) == nrow(mat_time_df))
+stopifnot(nrow(df.wane) == nrow(nir_time_df))
+
+# Spot check: every mat_only row should have exactly one mat_bin_ column == 1
+# (or all zero if their time_bin fell outside the defined range / was NA)
+mat_bin_cols <- grep("^mat_bin_", names(df.wane), value = TRUE)
+nir_bin_cols <- grep("^nir_bin_", names(df.wane), value = TRUE)
+# note that those who took both were having 0 for all the _bin_ columns
+
+df.wane %>%
+  filter(mat_only) %>%
+  summarise(row_sums_ok = all(rowSums(across(all_of(mat_bin_cols))) <= 1))
+
+df.wane %>%
+  filter(nir_only) %>%
+  summarise(row_sums_ok = all(rowSums(across(all_of(nir_bin_cols))) <= 1))
+
+
+# ------------------------------------------------------------------
+# check manually
+# ------------------------------------------------------------------
+temp <- df.wane %>% 
+  dplyr::select(mat_only, nir_only, both, neither, time_since_exposure, time_bin, 
+                starts_with("mat_bin"), starts_with("nir_bin"))
+```
+
+
+### VE of MV and nirsevimab over time since immunization (**Unstratified by season**) {.tabset}
+compare model:
+  * decrease
+  * AR1
+  * AR1 w/ linear structure
+  * spline (K = 6)
+ 
+```{r}
+set.seed(123)
+n.burnin <- 5000
+n.post.compare <- 5000 # for model comparison
+n.post.main <- 10000 # for main results
+```
+
+
+```{r}
+# prepare data for estimating the VE of nirsevimab and abrysvo 
+df.wane.nir <- df.wane %>% filter(nir_only == T | neither == T) %>%
+  rename_with(~ gsub("^nir_bin_", "wane_bin_", .x), starts_with("nir_bin_"))
+
+df.wane.mat <- df.wane %>% filter(mat_only == T | neither == T) %>% 
+  rename_with(~ gsub("^mat_bin_", "wane_bin_", .x), starts_with("mat_bin_"))
+
+bin_cols <- str_replace(mat_bin_cols, "mat", "wane")
+N_groups <- length(bin_cols)
+
+nrow(df.wane.nir); nrow(df.wane.mat)
+```
+
+
+
+#### what confounders do we need to include in the model for mat and nir?
+
+```{r}
+# -------------------------------
+# rsv activity
+# -------------------------------
+# yes, included for both products
+
+
+# -------------------------------
+# preexisting risk factors
+# -------------------------------
+# yes, included for both products
+
+
+# -------------------------------
+# birth weight (unbalanced between cases and controls)
+# -------------------------------
+# yes, included for both products
+
+
+# -------------------------------
+# gestage 
+# -------------------------------
+# yes, included for both products 
+
+# -------------------------------
+# age at test
+# -------------------------------
+# for MV: not need to include, as time since birth is age at test already
+# for nir: included 
+
+```
+
+
+#### waning VE estimated for nirsevimab (model using age as confounder)
+```{r}
+# ==============================================================================
+# decrease model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage,
+  age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_decrease_separate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_decrease_nir_infection.rds")
+  saveRDS(dic,  "../data/posterior/wane_sep_mv_nir/wane_decrease_nir_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_nir_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_nir_infection_dic.rds")
+}
+
+dic.decrease.nir.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.decrease.infection.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.decrease.infection.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.decrease.infection.nir$rowname <- rownames(ve.decrease.infection.nir)
+
+ve.decrease.infection.nir <- ve.decrease.infection.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.decrease.infection.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage,
+  age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_decrease_separate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_decrease_nir_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_decrease_nir_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_nir_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_nir_hosp_dic.rds")
+}
+
+dic.decrease.nir.hosp <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.decrease.hosp.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.decrease.hosp.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.decrease.hosp.nir$rowname <- rownames(ve.decrease.hosp.nir)
+
+ve.decrease.hosp.nir <- ve.decrease.hosp.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.decrease.hosp.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+
+
+# ==============================================================================
+# spline model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# prepare data
+# ------------------------------------------------------------------------------
+library(splines)
+
+# bin midpoints (in months or days, matching your time unit) for each product
+bin_points <- 1:N_groups   # or actual midpoint days if not evenly spaced
+
+K <- 6   # choose based on how much flexibility you want / can support with your data
+
+# use bs() or ns() ? used bs() (if using ns, the estiamtes are very low)
+B <- bs(bin_points, df = K, intercept = T)
+# B_mat <- bs(mat_bin_points, df = K_mat, intercept = T) # B-spline basis 
+
+# JAGS needs these as plain matrices
+B <- as.matrix(B)
+
+
+# B_mat is your 13 x 6 basis matrix; mat_bin_points is the x-axis (length 13)
+B_df <- as.data.frame(B)
+colnames(B_df) <- paste0("basis_", 1:ncol(B))
+B_df$x <- bin_points
+
+B_long <- B_df %>%
+  pivot_longer(cols = starts_with("basis_"), names_to = "basis", values_to = "value")
+
+ggplot(B_long, aes(x = x, y = value, color = basis)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    x = "Bin point",
+    y = "Basis function value",
+    color = "Basis function",
+    title = "Natural cubic spline basis (B_mat, K = 6, intercept = TRUE)"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+# ------------------------------------------------------------------------------
+# against RSV infection (30 days bin)
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups       = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  B              = B,
+  K              = K,
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  age_at_test    = df.jags$age_at_test_in_months,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_spline_separate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_spline_nir_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_spline_nir_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_nir_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_nir_infection_dic.rds")
+}
+
+dic.spline.nir.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.spline.infection.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.spline.infection.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.spline.infection.nir$rowname <- rownames(ve.spline.infection.nir)
+
+ve.spline.infection.nir <- ve.spline.infection.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.spline.infection.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization (30 days bin)
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups       = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  B              = B,
+  K              = K,
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage,
+  age_at_test    = df.jags$age_at_test_in_months
+  
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_spline_separate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_spline_nir_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_spline_nir_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_nir_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_nir_hosp_dic.rds")
+}
+
+dic.spline.nir.hosp <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.spline.hosp.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.spline.hosp.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.spline.hosp.nir$rowname <- rownames(ve.spline.hosp.nir)
+
+ve.spline.hosp.nir <- ve.spline.hosp.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.spline.hosp.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+
+
+# ==============================================================================
+# AR1 model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage,
+  age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_separate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1_nir_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1_nir_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_nir_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_nir_infection_dic.rds")
+}
+
+dic.AR1.nir.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1.infection.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1.infection.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1.infection.nir$rowname <- rownames(ve.AR1.infection.nir)
+
+ve.AR1.infection.nir <- ve.AR1.infection.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1.infection.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage,
+  age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_separate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1_nir_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1_nir_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_nir_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_nir_hosp_dic.rds")
+}
+
+dic.AR1.nir.hosp <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1.hosp.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1.hosp.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1.hosp.nir$rowname <- rownames(ve.AR1.hosp.nir)
+
+ve.AR1.hosp.nir <- ve.AR1.hosp.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1.hosp.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+
+# ==============================================================================
+# AR1Linear model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage,
+  age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_wLinear_seperate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_infection_dic.rds")
+}
+
+dic.AR1Linear.nir.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1Linear.infection.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1Linear.infection.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1Linear.infection.nir$rowname <- rownames(ve.AR1Linear.infection.nir)
+
+ve.AR1Linear.infection.nir <- ve.AR1Linear.infection.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1Linear.infection.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.nir %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage,
+  age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_wLinear_seperate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_hosp_dic.rds")
+}
+
+
+dic.AR1Linear.nir.hosp <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1Linear.hosp.nir <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1Linear.hosp.nir) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1Linear.hosp.nir$rowname <- rownames(ve.AR1Linear.hosp.nir)
+
+ve.AR1Linear.hosp.nir <- ve.AR1Linear.hosp.nir %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1Linear.hosp.nir.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+
+```
+
+
+#### **need to change the model excluding age as test from confounders**!!!!
+
+
+#### waning VE estimated for maternal vaccine (model using age as confounder)
+```{r eval = F}
+# ==============================================================================
+# decrease model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_decrease_separate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_decrease_mat_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_decrease_mat_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_mat_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_mat_infection_dic.rds")
+}
+
+dic.decrease.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.decrease.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.decrease.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.decrease.infection.mat$rowname <- rownames(ve.decrease.infection.mat)
+
+ve.decrease.infection.mat <- ve.decrease.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.decrease.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_decrease_separate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_decrease_mat_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_decrease_mat_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_mat_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_mat_hosp_dic.rds")
+}
+
+dic.decrease.mat.hosp <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.decrease.hosp.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.decrease.hosp.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.decrease.hosp.mat$rowname <- rownames(ve.decrease.hosp.mat)
+
+ve.decrease.hosp.mat <- ve.decrease.hosp.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.decrease.hosp.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+
+
+# ==============================================================================
+# spline model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# prepare data
+# ------------------------------------------------------------------------------
+library(splines)
+
+# bin midpoints (in months or days, matching your time unit) for each product
+bin_points <- 1:N_groups   # or actual midpoint days if not evenly spaced
+
+K <- 6   # choose based on how much flexibility you want / can support with your data
+
+# use bs() or ns() ? used bs() (if using ns, the estiamtes are very low)
+B <- bs(bin_points, df = K, intercept = T)
+# B_mat <- bs(mat_bin_points, df = K_mat, intercept = T) # B-spline basis 
+
+# JAGS needs these as plain matrices
+B <- as.matrix(B)
+
+
+# B_mat is your 13 x 6 basis matrix; mat_bin_points is the x-axis (length 13)
+B_df <- as.data.frame(B)
+colnames(B_df) <- paste0("basis_", 1:ncol(B))
+B_df$x <- bin_points
+
+B_long <- B_df %>%
+  pivot_longer(cols = starts_with("basis_"), names_to = "basis", values_to = "value")
+
+ggplot(B_long, aes(x = x, y = value, color = basis)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5) +
+  labs(
+    x = "Bin point",
+    y = "Basis function value",
+    color = "Basis function",
+    title = "Natural cubic spline basis (B_mat, K = 6, intercept = TRUE)"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+# ------------------------------------------------------------------------------
+# against RSV infection (30 days bin)
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups       = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  B              = B,
+  K              = K,
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_spline_separate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_spline_mat_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_spline_mat_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_mat_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_mat_infection_dic.rds")
+}
+
+dic.spline.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.spline.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.spline.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.spline.infection.mat$rowname <- rownames(ve.spline.infection.mat)
+
+ve.spline.infection.mat <- ve.spline.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.spline.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization (30 days bin)
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups       = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  B              = B,
+  K              = K,
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months,
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_spline_separate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_spline_mat_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_spline_mat_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_mat_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_mat_hosp_dic.rds")
+}
+
+dic.spline.mat.hosp <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.spline.hosp.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.spline.hosp.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.spline.hosp.mat$rowname <- rownames(ve.spline.hosp.mat)
+
+ve.spline.hosp.mat <- ve.spline.hosp.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.spline.hosp.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+
+
+# ==============================================================================
+# AR1 model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_separate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1_mat_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1_mat_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_mat_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_mat_infection_dic.rds")
+}
+
+dic.AR1.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1.infection.mat$rowname <- rownames(ve.AR1.infection.mat)
+
+ve.AR1.infection.mat <- ve.AR1.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_separate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1_mat_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1_mat_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_mat_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1_mat_hosp_dic.rds")
+}
+
+dic.AR1.mat.hosp <- sum(dic$deviance, na.rm = T) + sum(dic$penalty, na.rm = T)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1.hosp.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1.hosp.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1.hosp.mat$rowname <- rownames(ve.AR1.hosp.mat)
+
+ve.AR1.hosp.mat <- ve.AR1.hosp.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1.hosp.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+
+# ==============================================================================
+# AR1Linear model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_wLinear_seperate), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_infection_dic.rds")
+}
+
+dic.AR1Linear.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1Linear.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1Linear.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1Linear.infection.mat$rowname <- rownames(ve.AR1Linear.infection.mat)
+
+ve.AR1Linear.infection.mat <- ve.AR1Linear.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1Linear.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+# ------------------------------------------------------------------------------
+# against RSV hospitalization
+# ------------------------------------------------------------------------------
+df.jags <- df.wane.mat %>% filter(hosp_admitted_relevant == 1) %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_hosp <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  vax_time_group = as.matrix(df.jags[bin_cols]),
+  N_groups   = N_groups,
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+  # age_at_test    = df.jags$age_at_test_in_months
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_adjRSVinc_notrendAR_wLinear_seperate), data = ip_hosp, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_hosp.rds")
+  saveRDS(dic,     "../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_hosp_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_hosp.rds")
+  dic     <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_hosp_dic.rds")
+}
+
+dic.AR1Linear.mat.hosp <- sum(dic$deviance, na.rm = T) + sum(dic$penalty, na.rm = T)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1Linear.hosp.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1Linear.hosp.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1Linear.hosp.mat$rowname <- rownames(ve.AR1Linear.hosp.mat)
+
+ve.AR1Linear.hosp.mat <- ve.AR1Linear.hosp.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1Linear.hosp.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+
+```
+
+#### combine all the results from different models and products 
+```{r eval = F}
+# VE with median + CI 
+ve <- rbind(
+  rbind(ve.decrease.infection.mat %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.mat %>% mutate(model = "B-spline"),
+        ve.AR1.infection.mat %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.mat %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.infection.nir %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.nir %>% mutate(model = "B-spline"),
+        ve.AR1.infection.nir %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.nir %>% mutate(model = "AR1 w/ linear structure")
+        ) %>% mutate(endpoint = "MA RSV infection"),
+  rbind(ve.decrease.hosp.mat %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.hosp.mat %>% mutate(model = "B-spline"),
+        ve.AR1.hosp.mat %>% mutate(model = "AR1"),
+        ve.AR1Linear.hosp.mat %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.hosp.nir %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.hosp.nir %>% mutate(model = "B-spline"),
+        ve.AR1.hosp.nir %>% mutate(model = "AR1"),
+        ve.AR1Linear.hosp.nir %>% mutate(model = "AR1 w/ linear structure")
+        ) %>% mutate(endpoint = "RSV-associated hospitalization")
+) %>% mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>% 
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+
+# ve for spaghetti plot 
+ve.spa <- rbind(
+  rbind(ve.decrease.infection.mat.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.mat.spa %>% mutate(model = "B-spline"),
+        ve.AR1.infection.mat.spa %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.mat.spa %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.infection.nir.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.nir.spa %>% mutate(model = "B-spline"),
+        ve.AR1.infection.nir.spa %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.nir.spa %>% mutate(model = "AR1 w/ linear structure")
+        ) %>% mutate(endpoint = "MA RSV infection"),
+  rbind(ve.decrease.hosp.mat.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.hosp.mat.spa %>% mutate(model = "B-spline"),
+        ve.AR1.hosp.mat.spa %>% mutate(model = "AR1"),
+        ve.AR1Linear.hosp.mat.spa %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.hosp.nir.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.hosp.nir.spa %>% mutate(model = "B-spline"),
+        ve.AR1.hosp.nir.spa %>% mutate(model = "AR1"), 
+        ve.AR1Linear.hosp.nir.spa %>% mutate(model = "AR1 w/ linear structure")
+        ) %>% mutate(endpoint = "RSV-associated hospitalization")
+) %>% mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+
+
+# dic for different models
+grid <- expand.grid(
+  model    = c("decrease", "spline", "AR1", "AR1Linear"),
+  product  = c("mat", "nir"),
+  endpoint = c("infection", "hosp"),
+  stringsAsFactors = FALSE
+)
+
+grid$varname <- paste("dic", grid$model, grid$product, grid$endpoint, sep = ".")
+grid$value   <- sapply(grid$varname, get)
+
+df.dic <- grid[, c("value", "model", "endpoint", "product")]
+df.dic <- df.dic %>% 
+  dplyr::rename(DIC = value) %>%
+  mutate(endpoint = case_when(endpoint == "infection" ~ "MA RSV infection",
+                              endpoint == "hosp" ~ "RSV-associated hospitalization")) %>%
+  mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>% 
+  mutate(model = case_when(model == "decrease" ~ "Decrease trend imposed",
+                           model == "spline" ~ "B-spline",
+                           model == "AR1Linear" ~ "AR1 w/ linear structure",
+                           TRUE ~ model)) %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+  
+```
+
+
+
+### plot the waning VE (comparing nir and mat)
+
+#### VE with median and CI
+```{r eval = F, fig.height=6, fig.width = 10}
+dic_labels <- df.dic %>%
+  mutate(
+    label = paste0("DIC = ", round(DIC, 1)),
+    y_pos = ifelse(product == "RSVpreF", 98, 90)   # near the top
+  )
+
+ve %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1"))) %>%
+  ggplot(aes(x = month, y = VE_median, color = product, fill = product)) +
+  geom_ribbon(aes(ymin = VE_lb, ymax = VE_ub), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_text(
+    data = dic_labels,
+    aes(x = 12, y = y_pos, label = label, color = product),
+    hjust = 1, size = 3, fontface = "bold",
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  facet_grid(endpoint ~ model) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+```
+
+
+#### spaghetti plot 
+```{r eval=F, fig.height =6, fig.width = 10}
+library(dplyr)
+
+ggplot() +
+  # -- background:  CI ribbon, very low alpha --
+  geom_ribbon(data = ve,
+              aes(x = month, ymin = VE_lb, ymax = VE_ub, fill = product),
+              alpha = 0.15, color = NA) +
+
+  # -- foreground: spaghetti draws --
+  geom_line(data = ve.spa,
+            aes(x = month, y = VE, color = product, group = interaction(sample_id, product)),
+            alpha = 0.03, linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  # median line
+  geom_line(data = ve,
+            aes(x = month, y = VE_median, color = product),
+            alpha = 1, linewidth = 1) +
+  facet_grid( endpoint ~ model) +
+
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
+         fill  = "none") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+# save the estimates data for other use (fit_cc_mat.R)
+# saveRDS(ve, "fit_durMat/data/ve_wane_sep_mv_nir.rds")
+```
+
+
+
+
+### waning figure for MV manuscript
+
+#### main (endpoint: infection only; model: spline)
+
+```{r, eval = F, fig.height = 5, fig.width=5}
+plt.wane.mv.nir <- ggplot() +
+  # -- background:  CI ribbon, very low alpha --
+  geom_ribbon(data = ve %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model == "B-spline"),
+              aes(x = month, ymin = VE_lb, ymax = VE_ub, fill = product),
+              alpha = 0.15, color = NA) +
+
+  # -- foreground: spaghetti draws --
+  geom_line(data = ve.spa %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model == "B-spline"),
+            aes(x = month, y = VE, color = product, group = interaction(sample_id, product)),
+            alpha = 0.03, linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  # median line
+  geom_line(data = ve %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model == "B-spline"),
+            aes(x = month, y = VE_median, color = product),
+            alpha = 1, linewidth = 1) +
+  # geom_text(
+  #   data = dic_labels %>% 
+  #               filter(endpoint == "MA RSV infection") %>%
+  #               filter(model == "B-spline"),
+  #   aes(x = 12, y = y_pos, label = label, color = product),
+  #   hjust = 1, size = 3, fontface = "bold",
+  #   inherit.aes = FALSE, show.legend = FALSE
+  # ) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
+         fill  = "none") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+plt.wane.mv.nir
+
+# ggsave(plt.wane.mv.nir, filename = "../figs_tabs/figures/wane_sep_mv_nir/wane_ve_nir.pdf", height = 5, width = 5)
+```
+
+
+
+```{r  eval = F,fig.height = 5, fig.width=5}
+plt.wane.mv <- ggplot() +
+  # -- background:  CI ribbon, very low alpha --
+  geom_ribbon(data = ve %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model == "Decrease trend imposed") %>% 
+                filter(product == "RSVpreF"),
+              aes(x = month, ymin = VE_lb, ymax = VE_ub, fill = product),
+              alpha = 0.15, color = NA) +
+
+  # -- foreground: spaghetti draws --
+  geom_line(data = ve.spa %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model == "Decrease trend imposed") %>% 
+                filter(product == "RSVpreF"),
+            aes(x = month, y = VE, color = product, group = interaction(sample_id, product)),
+            alpha = 0.3, linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  # median line
+  geom_line(data = ve %>% 
+               filter(endpoint == "MA RSV infection") %>%
+                filter(model == "Decrease trend imposed") %>% 
+                filter(product == "RSVpreF"),
+            aes(x = month, y = VE_median),
+            alpha = 1, linewidth = 1, color = "black") +
+  # geom_text(
+  #   data = dic_labels %>% 
+  #               filter(endpoint == "MA RSV infection") %>%
+  #               filter(model == "B-spline"),
+  #   aes(x = 12, y = y_pos, label = label, color = product),
+  #   hjust = 1, size = 3, fontface = "bold",
+  #   inherit.aes = FALSE, show.legend = FALSE
+  # ) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
+         fill  = "none") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+plt.wane.mv
+
+# ggsave(plt.wane.mv, filename = "../figs_tabs/figures/wane_sep_mv_nir/wane_ve_mv.pdf", height = 5, width = 5)
+
+```
+
+
+#### supp (endpoint: infection; model comparison)
+```{r, eval = F,  fig.width = 9, fig.height = 4}
+plt.wane.mv.nir.compareMods <- ggplot() +
+  # -- background:  CI ribbon, very low alpha --
+  geom_ribbon(data = ve %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+              aes(x = month, ymin = VE_lb, ymax = VE_ub, fill = product),
+              alpha = 0.15, color = NA) +
+
+  # -- foreground: spaghetti draws --
+  geom_line(data = ve.spa %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+            aes(x = month, y = VE, color = product, group = interaction(sample_id, product)),
+            alpha = 0.03, linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  # median line
+  geom_line(data = ve %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+            aes(x = month, y = VE_median, color = product),
+            alpha = 1, linewidth = 1) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  geom_text(
+    data = dic_labels %>% 
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+    aes(x = 12, y = y_pos, label = label, color = product),
+    hjust = 1, size = 3, fontface = "bold",
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  facet_grid(~ model) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
+         fill  = "none") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+plt.wane.mv.nir.compareMods
+
+# ggsave(plt.wane.mv.nir.compareMods, filename = "../figs_tabs/figures/wane_sep_mv_nir/wane_ve_nir_compareMods.pdf", height = 4, width = 9)
+
+```
+
+
+#### traceplot for the spline model
+```{r, eval = F, fig.height=5, fig.width =8}
+samples_decrease_nir <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_nir_infection.rds")
+samples_AR1Linear_nir <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_nir_infection.rds")
+samples_spline_nir <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_nir_infection.rds")
+
+samples_decrease_mat <- readRDS("../data/posterior/wane_sep_mv_nir/wane_spline_mat_infection.rds")
+samples_AR1Linear_mat <- readRDS("../data/posterior/wane_sep_mv_nir/wane_AR1Linear_mat_infection.rds")
+samples_spline_mat <- readRDS("../data/posterior/wane_sep_mv_nir/wane_decrease_mat_infection.rds")
+
+
+
+# ── The six parameters to trace ──────────────────────────────────────────────
+# params <- c("beta_mat[1]", "beta_mat[6]", "beta_mat[12]",
+#             "beta_nir[1]", "beta_nir[6]", "beta_nir[12]")
+params <- c("beta[1]", "beta[6]", "beta[12]")
+
+# ── Helper: turn one rjags mcmc.list into a long tidy data frame ──────────────
+# keeps chain identity (so you can see mixing) and iteration index
+mcmc_to_long <- function(samples, model_name, keep = params) {
+  # samples is a coda mcmc.list: one matrix per chain
+  do.call(rbind, lapply(seq_along(samples), function(ch) {
+    m <- as.matrix(samples[[ch]])           # iterations x parameters
+    m <- m[, keep, drop = FALSE]            # keep only the six we want
+    data.frame(
+      model     = model_name,
+      chain     = factor(ch),
+      iteration = seq_len(nrow(m)),
+      m,
+      check.names = FALSE                    # preserve "beta_mat[1]" names
+    )
+  }))
+}
+
+# ── Build long data for each model, then stack ───────────────────────────────
+params_2 <- c("beta_mat[1]", "beta_mat[6]", "beta_mat[12]",
+            "beta_nir[1]", "beta_nir[6]", "beta_nir[12]")
+
+
+long_all <- bind_rows(
+  mcmc_to_long(samples_decrease_nir,  "Decrease trend imposed") %>% rename_with(~ sub("^beta\\[", "beta_nir[", .x), starts_with("beta[")),
+  mcmc_to_long(samples_spline_nir,    "B-spline") %>% rename_with(~ sub("^beta\\[", "beta_nir[", .x), starts_with("beta[")),
+  mcmc_to_long(samples_AR1Linear_nir, "AR1 w/ linear structure") %>% rename_with(~ sub("^beta\\[", "beta_nir[", .x), starts_with("beta["))) %>% 
+  left_join(
+    bind_rows(
+    mcmc_to_long(samples_decrease_mat,  "Decrease trend imposed") %>% rename_with(~ sub("^beta\\[", "beta_mat[", .x), starts_with("beta[")),
+    mcmc_to_long(samples_spline_mat,    "B-spline") %>% rename_with(~ sub("^beta\\[", "beta_mat[", .x), starts_with("beta[")),
+    mcmc_to_long(samples_AR1Linear_mat, "AR1 w/ linear structure") %>% rename_with(~ sub("^beta\\[", "beta_mat[", .x), starts_with("beta["))),
+    by = c("model", "chain", "iteration")
+  )  %>%
+  pivot_longer(cols = all_of(params_2),
+               names_to = "parameter", values_to = "value") %>%
+  mutate(
+    model     = factor(model,
+                       levels = c("B-spline","AR1 w/ linear structure", "Decrease trend imposed")),
+    parameter = factor(parameter, levels = params_2)   # fixes panel column order
+  ) 
+
+# ── Trace plot ───────────────────────────────────────────────────────────────
+plt.trace <- ggplot(long_all,
+                    aes(x = iteration, y = value, color = chain)) +
+  geom_line(linewidth = 0.25, alpha = 0.7) +
+  facet_grid(model ~ parameter, scales = "free_y") +
+  labs(x = "Iteration", y = "Value", color = "Chain") +
+  theme_bw(base_size = 11) +
+  theme(legend.position = "top",
+        strip.text.x = element_text(size = 9),
+        strip.text.y = element_text(size = 7),
+        axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)) 
+
+plt.trace
+# ggsave(plt.trace, filename = "../figs_tabs/figures/wane_sep_mv_nir/traceplot.pdf", height = 5, width = 8)
+```
+
+
+
+================================================================================
+================================================================================
+
+
+### updated on August 15th (agemodi)
+using a different jags structure to estimate waning of maternal vaccine. **Age as a modifier** for binary maternal vaccine, and calcualte VE at different ages. 
+
+
+#### prepare the data
+```{r}
+# remove those who take nirsevimab
+df.mat <- df.wane %>%  filter(nir_vaccinated_bf_test == 0)
+
+
+# ---------------------------------------------------------
+# create main exposure (also modifier): time since birth
+# ---------------------------------------------------------
+age_ref <- 0 # beta_mv is the log-OR at this age (like centering, but put ref at birth)
+
+df.mat <- df.mat %>%
+  mutate(abrysvo_vaccinated_for_current_delivery_14daysmore = 
+           ifelse(abrysvo_vaccinated_for_current_delivery == 1 & abrysvo_to_dob >= 14, 1, 0)) %>%
+  mutate(age_c = as.numeric(collection_date - babydob) - age_ref, 
+         mv = abrysvo_vaccinated_for_current_delivery_14daysmore)
+
+BREAKS <- seq(0, 390, 30) # 1 month interval for waning duration
+#BREAKS <- seq(0, 390, 60) 
+
+
+lower   <- c(0, BREAKS[2:(length(BREAKS) - 1)] + 1)   # 0, 31, 61, ..., 361
+upper   <- BREAKS[-1]                                  # 30, 60, ..., 390
+age_bin_lab <- paste0("age", lower, "-", upper, "d")
+
+df.mat <- df.mat %>%
+  mutate(
+    age_bin = cut(age_c, breaks = BREAKS, labels = age_bin_lab,
+                  right = TRUE, include.lowest = TRUE)
+  )
+
+# build dummy variables from age_bin
+df.mat <- df.mat %>% filter(!is.na(age_bin))
+
+dummies <- matrix(0L, nrow(df.mat), length(age_bin_lab),
+                  dimnames = list(NULL, age_bin_lab))
+dummies[cbind(seq_len(nrow(df.mat)), as.integer(df.mat$age_bin))] <- 1L
+
+df.mat <- cbind(df.mat, dummies)
+
+stopifnot(all(rowSums(df.mat[, age_bin_lab]) == 1))
+colSums(df.mat[, age_bin_lab])
+
+
+# ---------------------------------------------------------
+# calendar month of tested
+# ---------------------------------------------------------
+df.mat <- df.mat %>% 
+  mutate(month_tested = month(collection_date))
+
+df.mat <- df.mat %>%
+  mutate(month_tested = month(collection_date),
+         month_f      = factor(month_tested, levels = 1:12))
+
+# check before building — NAs here will silently misalign the matrix later
+sum(is.na(df.mat$collection_date))
+table(df.mat$month_tested, useNA = "ifany")
+
+M_month <- model.matrix(~ month_f, data = df.mat)[, -1, drop = FALSE]
+colnames(M_month) <- paste0("month_", 2:12)
+
+df.mat <- cbind(df.mat, M_month) %>% as.data.frame()
+```
+
+Estimate waning of Maternal vaccine (age as modifier)
+```{r}
+# ==============================================================================
+# decrease model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone, 
+                                 # starts_with("month_")
+                                  ) %>%
+  #dplyr::select(-month_tested, -month_f) %>%
+  as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_decrease), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_decrease_mat_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_decrease_mat_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_decrease_mat_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_decrease_mat_infection_dic.rds")
+}
+
+dic.decrease.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.decrease.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.decrease.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.decrease.infection.mat$rowname <- rownames(ve.decrease.infection.mat)
+
+ve.decrease.infection.mat <- ve.decrease.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.decrease.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+# ==============================================================================
+# spline model
+# ==============================================================================
+B_method <- "bs" # should use bs instead of ns (or the starting value will be from 0)
+
+
+# bin midpoints (in months or days, matching your time unit) for each product
+bin_points <- 1: length(age_bin_lab)   # or actual midpoint days if not evenly spaced
+
+K <- 6   # choose based on how much flexibility you want / can support with your data
+
+# use bs() or ns() ? used bs() (if using ns, the estiamtes are very low)
+if(B_method == "bs"){B <- bs(bin_points, df = K, intercept = T)}
+if(B_method == "ns"){B <- ns(bin_points, df = K, intercept = T)}
+
+# B_mat <- bs(mat_bin_points, df = K_mat, intercept = T) # B-spline basis 
+
+# JAGS needs these as plain matrices
+B <- as.matrix(B)
+
+
+# B_mat is your 13 x 6 basis matrix; mat_bin_points is the x-axis (length 13)
+B_df <- as.data.frame(B)
+colnames(B_df) <- paste0("basis_", 1:ncol(B))
+B_df$x <- bin_points
+
+B_long <- B_df %>%
+  pivot_longer(cols = starts_with("basis_"), names_to = "basis", values_to = "value")
+
+# ggplot(B_long, aes(x = x, y = value, color = basis)) +
+#   geom_line(linewidth = 1) +
+#   geom_point(size = 1.5) +
+#   labs(
+#     x = "Bin point",
+#     y = "Basis function value",
+#     color = "Basis function",
+#     title = "Natural cubic spline basis (B_mat, K = 6, intercept = TRUE)"
+#   ) +
+#   theme_minimal(base_size = 13)
+
+
+df.jags <- df.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone
+                                  # starts_with("month_")
+                                  ) %>%
+  #dplyr::select(-month_tested, -month_f) %>%
+  as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  B              = B,
+  K              = K,
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_spline), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  # save 
+  if(B_method == "bs"){ # if using bs() generating B
+    saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_bs.rds") 
+    saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_dic_bs.rds") 
+  }
+  if(B_method == "ns"){ # if using ns() generating B
+    saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_ns.rds") 
+    saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_dic_ns.rds")
+  }
+
+}else{
+  # read in from file
+  if(B_method == "bs"){ # if using bs() generating B
+    samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_bs.rds") 
+    dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_dic_bs.rds")
+  }
+  if(B_method == "ns"){ # if using ns() generating B
+    samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_ns.rds")
+    dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_mat_infection_dic_ns.rds")
+  }
+
+  
+}
+
+dic.spline.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.spline.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.spline.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.spline.infection.mat$rowname <- rownames(ve.spline.infection.mat)
+
+ve.spline.infection.mat <- ve.spline.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.spline.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+# ==============================================================================
+# AR1 model
+# ==============================================================================
+df.jags <- df.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_notrendAR), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names = c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_AR1_mat_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_AR1_mat_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1_mat_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1_mat_infection_dic.rds")
+}
+
+dic.AR1.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1.infection.mat$rowname <- rownames(ve.AR1.infection.mat)
+
+ve.AR1.infection.mat <- ve.AR1.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+
+
+# ==============================================================================
+# AR1Linear model
+# ==============================================================================
+df.jags <- df.mat %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_notrendAR_wLinear), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection_dic.rds")
+}
+
+dic.AR1Linear.mat.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_mat[1]"])
+
+
+# calculate VE from each beta
+ve.AR1Linear.infection.mat <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1Linear.infection.mat) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1Linear.infection.mat$rowname <- rownames(ve.AR1Linear.infection.mat)
+
+ve.AR1Linear.infection.mat <- ve.AR1Linear.infection.mat %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "mat")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1Linear.infection.mat.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "mat")
+
+```
+
+
+
+
+
+#### combine all the results 
+Note that here waning VE from nirsevimab and RSVpreF were generated from different model
+  * nirsevimab: age as confounder 
+  * RSVpreF: additionally as modifier
+
+```{r}
+# VE with median + CI 
+ve <- rbind(
+        ve.decrease.infection.mat %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.mat %>% mutate(model = "B-spline"),
+        # ve.AR1.infection.mat %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.mat %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.infection.nir %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.nir %>% mutate(model = "B-spline"),
+        # ve.AR1.infection.nir %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.nir %>% mutate(model = "AR1 w/ linear structure")
+        ) %>%
+    mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>% 
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+
+# ve for spaghetti plot 
+ve.spa <- rbind(
+        ve.decrease.infection.mat.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.mat.spa %>% mutate(model = "B-spline"),
+        #ve.AR1.infection.mat.spa %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.mat.spa %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.infection.nir.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.nir.spa %>% mutate(model = "B-spline"),
+        #ve.AR1.infection.nir.spa %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.nir.spa %>% mutate(model = "AR1 w/ linear structure")
+        ) %>% mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+
+
+# dic for different models
+grid <- expand.grid(
+  model    = c("decrease", "spline",  "AR1Linear"),
+  product  = c("mat", "nir"),
+  endpoint = c("infection"),
+  stringsAsFactors = FALSE
+)
+
+grid$varname <- paste("dic", grid$model, grid$product, grid$endpoint, sep = ".")
+grid$value   <- sapply(grid$varname, get)
+
+df.dic <- grid[, c("value", "model", "endpoint", "product")]
+df.dic <- df.dic %>% 
+  dplyr::rename(DIC = value) %>%
+  mutate(endpoint = case_when(endpoint == "infection" ~ "MA RSV infection",
+                              endpoint == "hosp" ~ "RSV-associated hospitalization")) %>%
+  mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>% 
+  mutate(model = case_when(model == "decrease" ~ "Decrease trend imposed",
+                           model == "spline" ~ "B-spline",
+                           model == "AR1Linear" ~ "AR1 w/ linear structure",
+                           TRUE ~ model)) %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+  
+```
+
+
+
+### plot the waning VE (comparing nir and mat) 
+Note that here waning VE from nirsevimab and RSVpreF were generated from different model
+  * nirsevimab: age as confounder 
+  * RSVpreF: additionally as modifier
+  
+  
+#### VE with median and CI
+```{r fig.height=4.5 , fig.width = 10}
+dic_labels <- df.dic %>%
+  mutate(
+    label = paste0("DIC = ", round(DIC, 1)),
+    y_pos = ifelse(product == "RSVpreF", 98, 90)   # near the top
+  )
+
+ve %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1"))) %>%
+  ggplot(aes(x = month, y = VE_median, color = product, fill = product)) +
+  geom_ribbon(aes(ymin = VE_lb, ymax = VE_ub), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_text(
+    data = dic_labels,
+    aes(x = 12, y = y_pos, label = label, color = product),
+    hjust = 1, size = 3, fontface = "bold",
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  facet_grid( ~ model) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+```
+
+
+```{r fig.height=4.5, fig.width = 10}
+plt.wane.mv.nir.compareMods <- ggplot() +
+  # -- background:  CI ribbon, very low alpha --
+  geom_ribbon(data = ve %>% 
+                #filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+              aes(x = month, ymin = VE_lb, ymax = VE_ub, fill = product),
+              alpha = 0.15, color = NA) +
+
+  # -- foreground: spaghetti draws --
+  geom_line(data = ve.spa %>% 
+                #filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+            aes(x = month, y = VE, color = product, group = interaction(sample_id, product)),
+            alpha = 0.03, linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  # median line
+  geom_line(data = ve %>% 
+               # filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+            aes(x = month, y = VE_median, color = product),
+            alpha = 1, linewidth = 1) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  geom_text(
+    data = dic_labels %>%
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+    aes(x = 12, y = y_pos, label = label, color = product),
+    hjust = 1, size = 3, fontface = "bold",
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  facet_grid(~ model) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
+         fill  = "none") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+plt.wane.mv.nir.compareMods
+
+# ggsave(plt.wane.mv.nir.compareMods, filename = "../figs_tabs/figures/wane_mv_agemodi/wane_ve_nir_compareMods.pdf", height = 4, width = 9)
+```
+
+
+```{r}
+# save the waning curve for later estiamtion of duration from Mat
+# saveRDS(ve, "fit_durMat/data/ve_wane_sep_mv_nir.rds")
+```
+
+
+```{r eval = F}
+nrow(df.mv )
+a <- df.mv %>% filter(abrysvo_vaccinated_for_current_delivery == 1)
+a <- a %>% mutate(t_abrysvo_to_birth = as.numeric(babydob - abrysvo_date)/7) %>% 
+  mutate(gest_at_abrysvo= gestage - t_abrysvo_to_birth)
+
+summary(a$gest_at_abrysvo)
+summary(a$gestage)
+
+
+b <- df.wane %>%  filter((nir_vaccinated_bf_test == 1 & abrysvo_vaccinated_for_current_delivery == 0) |
+                                (nir_vaccinated_bf_test == 0 & abrysvo_vaccinated_for_current_delivery == 0) ) %>% 
+  filter(nir_vaccinated_bf_test==1)
+
+hist(b$age_at_nir_in_months)
+
+plt.age.at.nir <- b %>%
+  ggplot(aes(x = age_at_nir_in_months)) +
+  geom_histogram(binwidth = 1, boundary = 0,
+                 fill = "grey80", color = "black") +
+  scale_x_continuous(breaks = 0:9) +
+  labs(x = "Age at nirsevimab immunization (months)",
+       y = "Number of infants") +
+  theme_classic()
+plt.age.at.nir
+# ggsave(plt.age.at.nir, filename = "../figs_tabs/figures/wane_mv_agemodi/age_at_nir.pdf", width = 6, height =4 )
+
+b %>% filter(age_at_nir_in_months <= 1 ) %>% nrow() 
+870/nrow(b)
+```
+
+
+<br>
+<br>
+<br>
+
+
+
+
+Sensitivity analysis for nirsevimab waning: 
+  * restrict to infants dosed within the first month, where age = T by construction, and fit the same structure as the maternal model — age main effect plus exposure × age-bin interaction. (refit to the RSVpreF model in which age is a modifier instead of a confounder)
+  
+#### prepare the data
+```{r}
+# remove those who take nirsevimab
+df.nir <- df.wane %>%  filter((nir_vaccinated_bf_test == 1 & abrysvo_vaccinated_for_current_delivery == 0) |
+                                (nir_vaccinated_bf_test == 0 & abrysvo_vaccinated_for_current_delivery == 0) ) # 2886 (the analytic pop above)
+
+# keep only those immunized close to birth
+df.nir <- df.nir %>% filter(nir_vaccinated_bf_test == 0 | (nir_vaccinated_bf_test == 1) & age_at_nir_in_months <= 1) # 2654
+
+
+# ---------------------------------------------------------
+# create main exposure (also modifier): time since birth
+# ---------------------------------------------------------
+age_ref <- 0 # beta_mv is the log-OR at this age (like centering, but put ref at birth)
+
+df.nir <- df.nir %>%
+  mutate(age_c = as.numeric(collection_date - babydob) - age_ref, 
+         mv = nir_vaccinated_bf_test )
+
+BREAKS <- seq(0, 390, 30) # 1 month interval for waning duration
+#BREAKS <- seq(0, 390, 60) 
+
+
+lower   <- c(0, BREAKS[2:(length(BREAKS) - 1)] + 1)   # 0, 31, 61, ..., 361
+upper   <- BREAKS[-1]                                  # 30, 60, ..., 390
+age_bin_lab <- paste0("age", lower, "-", upper, "d")
+
+df.nir <- df.nir %>%
+  mutate(
+    age_bin = cut(age_c, breaks = BREAKS, labels = age_bin_lab,
+                  right = TRUE, include.lowest = TRUE)
+  )
+
+# build dummy variables from age_bin
+df.nir <- df.nir %>% filter(!is.na(age_bin))
+
+dummies <- matrix(0L, nrow(df.nir), length(age_bin_lab),
+                  dimnames = list(NULL, age_bin_lab))
+dummies[cbind(seq_len(nrow(df.nir)), as.integer(df.nir$age_bin))] <- 1L
+
+df.nir <- cbind(df.nir, dummies)
+
+stopifnot(all(rowSums(df.nir[, age_bin_lab]) == 1))
+colSums(df.nir[, age_bin_lab])
+
+
+# ---------------------------------------------------------
+# calendar month of tested
+# ---------------------------------------------------------
+df.nir <- df.nir %>% 
+  mutate(month_tested = month(collection_date))
+
+df.nir <- df.nir %>%
+  mutate(month_tested = month(collection_date),
+         month_f      = factor(month_tested, levels = 1:12))
+
+# check before building — NAs here will silently misalign the matrix later
+sum(is.na(df.nir$collection_date))
+table(df.nir$month_tested, useNA = "ifany")
+
+M_month <- model.matrix(~ month_f, data = df.nir)[, -1, drop = FALSE]
+colnames(M_month) <- paste0("month_", 2:12)
+
+df.nir <- cbind(df.nir, M_month) %>% as.data.frame()
+```
+
+Estimate waning of Maternal vaccine (age as modifier)
+```{r}
+# ==============================================================================
+# decrease model
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# against MA RSV infection
+# ------------------------------------------------------------------------------
+df.jags <- df.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone, 
+                                 # starts_with("month_")
+                                  ) %>%
+  #dplyr::select(-month_tested, -month_f) %>%
+  as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_decrease), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_decrease_nir_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_decrease_nir_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_decrease_nir_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_decrease_nir_infection_dic.rds")
+}
+
+dic.decrease.niratbirth.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_nir[1]"])
+
+
+# calculate VE from each beta
+ve.decrease.infection.niratbirth <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.decrease.infection.niratbirth) <- c("VE_ub", "VE_median", "VE_lb")
+ve.decrease.infection.niratbirth$rowname <- rownames(ve.decrease.infection.niratbirth)
+
+ve.decrease.infection.niratbirth <- ve.decrease.infection.niratbirth %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.decrease.infection.niratbirth.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+# ==============================================================================
+# spline model
+# ==============================================================================
+B_method <- "bs" # should use bs instead of ns (or the starting value will be from 0)
+
+
+# bin midpoints (in months or days, nirching your time unit) for each product
+bin_points <- 1: length(age_bin_lab)   # or actual midpoint days if not evenly spaced
+
+K <- 6   # choose based on how much flexibility you want / can support with your data
+
+# use bs() or ns() ? used bs() (if using ns, the estiamtes are very low)
+if(B_method == "bs"){B <- bs(bin_points, df = K, intercept = T)}
+if(B_method == "ns"){B <- ns(bin_points, df = K, intercept = T)}
+
+# B_nir <- bs(nir_bin_points, df = K_nir, intercept = T) # B-spline basis 
+
+# JAGS needs these as plain nirrices
+B <- as.matrix(B)
+
+
+# B_nir is your 13 x 6 basis nirrix; nir_bin_points is the x-axis (length 13)
+B_df <- as.data.frame(B)
+colnames(B_df) <- paste0("basis_", 1:ncol(B))
+B_df$x <- bin_points
+
+B_long <- B_df %>%
+  pivot_longer(cols = starts_with("basis_"), names_to = "basis", values_to = "value")
+
+# ggplot(B_long, aes(x = x, y = value, color = basis)) +
+#   geom_line(linewidth = 1) +
+#   geom_point(size = 1.5) +
+#   labs(
+#     x = "Bin point",
+#     y = "Basis function value",
+#     color = "Basis function",
+#     title = "Natural cubic spline basis (B_nir, K = 6, intercept = TRUE)"
+#   ) +
+#   theme_minimal(base_size = 13)
+
+
+df.jags <- df.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone
+                                  # starts_with("month_")
+                                  ) %>%
+  #dplyr::select(-month_tested, -month_f) %>%
+  as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  B              = B,
+  K              = K,
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_spline), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  # save 
+  if(B_method == "bs"){ # if using bs() generating B
+    saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_bs.rds") 
+    saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_dic_bs.rds") 
+  }
+  if(B_method == "ns"){ # if using ns() generating B
+    saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_ns.rds") 
+    saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_dic_ns.rds")
+  }
+
+}else{
+  # read in from file
+  if(B_method == "bs"){ # if using bs() generating B
+    samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_bs.rds") 
+    dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_dic_bs.rds")
+  }
+  if(B_method == "ns"){ # if using ns() generating B
+    samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_ns.rds")
+    dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_spline_nir_infection_dic_ns.rds")
+  }
+
+  
+}
+
+dic.spline.niratbirth.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_nir[1]"])
+
+
+# calculate VE from each beta
+ve.spline.infection.niratbirth <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.spline.infection.niratbirth) <- c("VE_ub", "VE_median", "VE_lb")
+ve.spline.infection.niratbirth$rowname <- rownames(ve.spline.infection.niratbirth)
+
+ve.spline.infection.niratbirth <- ve.spline.infection.niratbirth %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.spline.infection.niratbirth.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+# ==============================================================================
+# AR1 model
+# ==============================================================================
+df.jags <- df.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_notrendAR), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names = c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_AR1_nir_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_AR1_nir_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1_nir_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1_nir_infection_dic.rds")
+}
+
+dic.AR1.niratbirth.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_nir[1]"])
+
+
+# calculate VE from each beta
+ve.AR1.infection.niratbirth <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1.infection.niratbirth) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1.infection.niratbirth$rowname <- rownames(ve.AR1.infection.niratbirth)
+
+ve.AR1.infection.niratbirth <- ve.AR1.infection.niratbirth %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1.infection.niratbirth.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+
+
+# ==============================================================================
+# AR1Linear model
+# ==============================================================================
+df.jags <- df.nir %>% mutate(case_status = positive_rsv)
+
+M_cf <- df.jags %>% dplyr::select(rf_atleastone)  %>% as.matrix()
+
+ip_infection <- list(
+  N_records      = nrow(df.jags),
+  case_status    = df.jags$case_status,
+  mv = df.jags$mv, # binary for MV
+  age_group = as.matrix(df.jags[age_bin_lab]),
+  N_groups   = length(age_bin_lab),
+  M_cf           = M_cf,
+  N_cf           = ncol(M_cf), 
+  rsv_activity   = df.jags$log_positivity_ext_c,
+  birthwt        = df.jags$birthwt,
+  gestage        = df.jags$gestage
+)
+
+
+if(rerun){
+  
+  jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_notrendAR_wLinear), data = ip_infection, n.chains = 3)
+  dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
+  # update(jags.post, n.iter = n.post.main)
+  samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  
+  saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection.rds")
+  saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection_dic.rds")
+
+}else{
+  samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection.rds")
+  dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection_dic.rds")
+}
+
+dic.AR1Linear.niratbirth.infection <- sum(dic$deviance) + sum(dic$penalty)
+
+post1 <- as.data.frame(as.matrix(samples[[1]]))  
+post2 <- as.data.frame(as.matrix(samples[[2]])) 
+post3 <- as.data.frame(as.matrix(samples[[3]])) 
+post <- bind_rows(post1, post2, post3)
+# post <- rbind(post1, post2, post3)
+#plot(samples[, "beta_nir[1]"])
+
+
+# calculate VE from each beta
+ve.AR1Linear.infection.niratbirth <- as.data.frame(t(apply(post, 2, quantile, probs = c(0.025, 0.5, 0.975), na.rm = TRUE)))
+colnames(ve.AR1Linear.infection.niratbirth) <- c("VE_ub", "VE_median", "VE_lb")
+ve.AR1Linear.infection.niratbirth$rowname <- rownames(ve.AR1Linear.infection.niratbirth)
+
+ve.AR1Linear.infection.niratbirth <- ve.AR1Linear.infection.niratbirth %>% 
+  mutate(month = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])"))) %>%
+  mutate(VE_lb = (1 - exp(VE_lb)) * 100, 
+         VE_median = (1 - exp(VE_median)) * 100,
+         VE_ub = (1- exp(VE_ub)) * 100)  %>%
+  dplyr::select(-rowname) %>%
+  mutate(product = "nir")
+
+# ---- NEW: sample 1000 draws instead of collapsing to quantiles ----
+set.seed(123)  # for reproducibility; drop or change as needed
+n_spaghetti <- 1000
+sample_idx <- sample(seq_len(nrow(post)), size = n_spaghetti, replace = FALSE)
+post_sample <- post[sample_idx, ]
+post_sample$sample_id <- seq_len(nrow(post_sample))
+
+ve.AR1Linear.infection.niratbirth.spa <- post_sample %>%
+  pivot_longer(cols = -sample_id, names_to = "rowname", values_to = "beta") %>%
+  mutate(
+    month   = as.numeric(str_extract(rowname, "(?<=\\[)\\d+(?=\\])")),
+    VE      = (1 - exp(beta)) * 100
+  ) %>%
+  dplyr::select(-rowname, -beta) %>% 
+  mutate(product = "nir")
+
+```
+
+
+
+#### combine all the results from different models and products 
+Note that here waning VE from both nirsevimab and RSVpreF were generated from the same model using age as modifier. (for nirsevimab, only those vaccinated within the first month after birth were included.)
+
+```{r}
+# VE with median + CI 
+ve.vaxatbirth <- rbind(
+        ve.decrease.infection.mat %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.mat %>% mutate(model = "B-spline"),
+        # ve.AR1.infection.mat %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.mat %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.infection.niratbirth %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.niratbirth %>% mutate(model = "B-spline"),
+        # ve.AR1.infection.nir %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.niratbirth %>% mutate(model = "AR1 w/ linear structure")
+        ) %>%
+    mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>% 
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+
+# ve for spaghetti plot 
+ve.spa.vaxatbirth <- rbind(
+        ve.decrease.infection.mat.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.mat.spa %>% mutate(model = "B-spline"),
+        #ve.AR1.infection.mat.spa %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.mat.spa %>% mutate(model = "AR1 w/ linear structure"),
+        ve.decrease.infection.niratbirth.spa %>% mutate(model = "Decrease trend imposed"),
+        ve.spline.infection.niratbirth.spa %>% mutate(model = "B-spline"),
+        #ve.AR1.infection.nir.spa %>% mutate(model = "AR1"),
+        ve.AR1Linear.infection.niratbirth.spa %>% mutate(model = "AR1 w/ linear structure")
+        ) %>% mutate(product = case_when(product == "nir" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+
+
+# dic for different models
+grid.vaxatbirth <- expand.grid(
+  model    = c("decrease", "spline",  "AR1Linear"),
+  product  = c("mat", "niratbirth"),
+  endpoint = c("infection"),
+  stringsAsFactors = FALSE
+)
+
+grid.vaxatbirth$varname <- paste("dic", grid.vaxatbirth$model, grid.vaxatbirth$product, grid.vaxatbirth$endpoint, sep = ".")
+grid.vaxatbirth$value   <- sapply(grid.vaxatbirth$varname, get)
+
+df.dic.vaxatbirth <- grid.vaxatbirth[, c("value", "model", "endpoint", "product")]
+df.dic.vaxatbirth <- df.dic.vaxatbirth %>% 
+  dplyr::rename(DIC = value) %>%
+  mutate(endpoint = case_when(endpoint == "infection" ~ "MA RSV infection",
+                              endpoint == "hosp" ~ "RSV-associated hospitalization")) %>%
+  mutate(product = case_when(product == "niratbirth" ~ "nirsevimab",
+                                 product == "mat" ~ "RSVpreF")) %>% 
+  mutate(model = case_when(model == "decrease" ~ "Decrease trend imposed",
+                           model == "spline" ~ "B-spline",
+                           model == "AR1Linear" ~ "AR1 w/ linear structure",
+                           TRUE ~ model)) %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1")))
+  
+```
+
+
+
+### plot the waning VE (comparing nir and mat) 
+
+#### VE with median and CI
+```{r fig.height=4.5 , fig.width = 10}
+dic_labels_vaxatbirth <- df.dic.vaxatbirth %>%
+  mutate(
+    label = paste0("DIC = ", round(DIC, 1)),
+    y_pos = ifelse(product == "RSVpreF", 98, 90)   # near the top
+  )
+
+ve.vaxatbirth %>%
+  mutate(product = factor(product, levels = c("RSVpreF", "nirsevimab"))) %>%
+  mutate(model = factor(model, levels = c("B-spline",
+                                          "AR1 w/ linear structure",
+                                          "Decrease trend imposed",
+                                          "AR1"))) %>%
+  ggplot(aes(x = month, y = VE_median, color = product, fill = product)) +
+  geom_ribbon(aes(ymin = VE_lb, ymax = VE_ub), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_text(
+    data = dic_labels,
+    aes(x = 12, y = y_pos, label = label, color = product),
+    hjust = 1, size = 3, fontface = "bold",
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  facet_grid( ~ model) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+```
+
+
+```{r fig.height=4.5, fig.width = 10}
+plt.wane.mv.nir.compareMods.vaxatbirth <- ggplot() +
+  # -- background:  CI ribbon, very low alpha --
+  geom_ribbon(data = ve.vaxatbirth %>% 
+                #filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+              aes(x = month, ymin = VE_lb, ymax = VE_ub, fill = product),
+              alpha = 0.15, color = NA) +
+
+  # -- foreground: spaghetti draws --
+  geom_line(data = ve.spa.vaxatbirth %>% 
+                #filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+            aes(x = month, y = VE, color = product, group = interaction(sample_id, product)),
+            alpha = 0.03, linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  # median line
+  geom_line(data = ve.vaxatbirth %>% 
+               # filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+            aes(x = month, y = VE_median, color = product),
+            alpha = 1, linewidth = 1) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  geom_text(
+    data = dic_labels_vaxatbirth %>%
+                filter(endpoint == "MA RSV infection") %>%
+                filter(model != "AR1"),
+    aes(x = 12, y = y_pos, label = label, color = product),
+    hjust = 1, size = 3, fontface = "bold",
+    inherit.aes = FALSE, show.legend = FALSE
+  ) +
+  facet_grid(~ model) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
+         fill  = "none") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+plt.wane.mv.nir.compareMods.vaxatbirth
+
+# ggsave(plt.wane.mv.nir.compareMods.vaxatbirth, filename = "../figs_tabs/figures/wane_mv_agemodi/wane_ve_nir_compareMods_vaxatbirth.pdf", height = 4, width = 9)
+```
+
+
+### keep only the the decrease model (as the main model)
+```{r, fig.width = 4, fig.height = 4.2}
+plt.wane.mv.nir.compareMods.vaxatbirth.main <- ggplot() +
+  # -- background:  CI ribbon, very low alpha --
+  geom_ribbon(data = ve.vaxatbirth %>% 
+                #filter(endpoint == "MA RSV infection") %>%
+                filter(model == "Decrease trend imposed"),
+              aes(x = month, ymin = VE_lb, ymax = VE_ub, fill = product),
+              alpha = 0.15, color = NA) +
+
+  # -- foreground: spaghetti draws --
+  geom_line(data = ve.spa.vaxatbirth %>% 
+                #filter(endpoint == "MA RSV infection") %>%
+                filter(model == "Decrease trend imposed"),
+            aes(x = month, y = VE, color = product, group = interaction(sample_id, product)),
+            alpha = 0.03, linewidth = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  scale_color_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  scale_fill_manual(values = c("RSVpreF" = "#2C7FB8", "nirsevimab" = "#D95F02")) +
+  # median line
+  geom_line(data = ve.vaxatbirth %>% 
+               # filter(endpoint == "MA RSV infection") %>%
+                filter(model == "Decrease trend imposed"),
+            aes(x = month, y = VE_median, color = product),
+            alpha = 1, linewidth = 1) +
+  labs(
+    x = "Months elapsed",
+    y = "Effectiveness (%)",
+    color = "Product",
+    fill = "Product"
+  ) +
+  # geom_text(
+  #   data = dic_labels_vaxatbirth %>%
+  #               filter(endpoint == "MA RSV infection") %>%
+  #               filter(model == "Decrease trend imposed"),
+  #   aes(x = 12, y = y_pos, label = label, color = product),
+  #   hjust = 1, size = 3, fontface = "bold",
+  #   inherit.aes = FALSE, show.legend = FALSE
+  # ) +
+  facet_grid(~ model) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
+         fill  = "none") +
+  theme_bw(base_size = 13) +
+  theme(legend.position = "top") +
+  coord_cartesian(ylim = c(0, 100)) +
+  scale_x_continuous(breaks = 1:12, labels = as.character(1:12))
+
+plt.wane.mv.nir.compareMods.vaxatbirth.main
+
+# ggsave(plt.wane.mv.nir.compareMods.vaxatbirth.main, filename = "../figs_tabs/figures/wane_mv_agemodi/wane_ve_nir_compareMods_vaxatbirth_main.pdf", height = 4.2, width = 4)
+
+### check the data to fill in the main text 
+ve.vaxatbirth %>% filter(model == "Decrease trend imposed") %>% filter(product == "RSVpreF")
+ve.vaxatbirth %>% filter(model == "Decrease trend imposed") %>% filter(product == "nirsevimab")
+```
+
+
+
+
+```{r}
+# save the waning curve for later estiamtion of duration from Mat
+# saveRDS(ve, "fit_durMat/data/ve_wane_sep_mv_nir.rds")
+```
+
+```{r eval = F}
+tocheck_id <- c("7292256", "7281450", "8656445", "8596605", "8593232", "7327659", "7293770", "7278498", "8624694", "7286222", "8080806", "8607406", "7308410", "7266822", "7299028", "8493240", "8485822", "7350074")
+df %>% filter(babystudyid %in%  tocheck_id) %>% dplyr::select(babystudyid, babydob, abrysvo_date) %>% distinct()
+df %>% filter(babystudyid == "7350074") %>% dplyr::select(babystudyid, babydob, abrysvo_date) %>% distinct()
+
+```
+
+
+
+
