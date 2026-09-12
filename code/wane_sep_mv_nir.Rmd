@@ -2659,12 +2659,15 @@ if(rerun){
   jags.post <- rjags::jags.model(textConnection(mod_wane_agemodi_notrendAR_wLinear), data = ip_infection, n.chains = 3)
   dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
   # update(jags.post, n.iter = n.post.main)
+  samples.mu <- rjags::coda.samples(jags.post, variable.names=c("mu0", "mu1"), n.iter = 5000)
   samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
   
+  saveRDS(samples.mu, "../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection_mu.rds")
   saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection.rds")
   saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection_dic.rds")
 
 }else{
+  samples.mu <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection_mu.rds")
   samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection.rds")
   dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_mat_infection_dic.rds")
 }
@@ -2676,7 +2679,9 @@ post2 <- as.data.frame(as.matrix(samples[[2]]))
 post3 <- as.data.frame(as.matrix(samples[[3]])) 
 post <- bind_rows(post1, post2, post3)
 # post <- rbind(post1, post2, post3)
-#plot(samples[, "beta_mat[1]"])
+# plot(samples[, "beta[1]"])
+# plot(samples.mu[, "mu0"]) # converges 
+# plot(samples.mu[, "mu1"]) # converges
 
 
 # calculate VE from each beta
@@ -2935,7 +2940,7 @@ b %>% filter(age_at_nir_in_months <= 1 ) %>% nrow()
 
 
 
-Sensitivity analysis for nirsevimab waning: 
+Use the same model with age as modifier for nirsevimab waning: 
   * restrict to infants dosed within the first month, where age = T by construction, and fit the same structure as the maternal model — age main effect plus exposure × age-bin interaction. (refit to the RSVpreF model in which age is a modifier instead of a confounder)
   
 #### prepare the data
@@ -3004,7 +3009,7 @@ colnames(M_month) <- paste0("month_", 2:12)
 df.nir <- cbind(df.nir, M_month) %>% as.data.frame()
 ```
 
-Estimate waning of Maternal vaccine (age as modifier)
+Estimate waning of nirsevimab using the same model using age as modifier
 ```{r}
 # ==============================================================================
 # decrease model
@@ -3332,12 +3337,15 @@ if(rerun){
   dic <- rjags::dic.samples(jags.post, n.iter = 5000, type = "pD")
   # update(jags.post, n.iter = n.post.main)
   samples <- rjags::coda.samples(jags.post, variable.names=c("beta"), n.iter = 5000)
+  samples.mu <- rjags::coda.samples(jags.post, variable.names=c("mu0", "mu1"), n.iter = 5000)
   
+  saveRDS(samples.mu, "../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection_mu.rds")
   saveRDS(samples, "../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection.rds")
   saveRDS(dic,     "../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection_dic.rds")
 
 }else{
   samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection.rds")
+  samples.mu <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection_mu.rds")
   dic     <- readRDS("../data/posterior/wane_mv_agemodi/wane_AR1Linear_nir_infection_dic.rds")
 }
 
@@ -3348,7 +3356,8 @@ post2 <- as.data.frame(as.matrix(samples[[2]]))
 post3 <- as.data.frame(as.matrix(samples[[3]])) 
 post <- bind_rows(post1, post2, post3)
 # post <- rbind(post1, post2, post3)
-#plot(samples[, "beta_nir[1]"])
+# plot(samples.mu[, "mu0"])
+# plot(samples.mu[, "mu1"])
 
 
 # calculate VE from each beta
@@ -3480,7 +3489,7 @@ ve.vaxatbirth %>%
   geom_point(size = 2) +
   geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
   geom_text(
-    data = dic_labels,
+    data = dic_labels_vaxatbirth,
     aes(x = 12, y = y_pos, label = label, color = product),
     hjust = 1, size = 3, fontface = "bold",
     inherit.aes = FALSE, show.legend = FALSE
@@ -3501,8 +3510,18 @@ ve.vaxatbirth %>%
 
 ```
 
-
+#### waning VE (age as modifier), compare models (supp figure)
 ```{r fig.height=4.5, fig.width = 10}
+# put decreasing model on the left (main model)
+ve.vaxatbirth <- ve.vaxatbirth %>% 
+  mutate(model = factor(model, levels = c("Decrease trend imposed", "AR1 w/ linear structure", "B-spline")))
+
+
+dic_labels_vaxatbirth <- dic_labels_vaxatbirth %>%
+  mutate(model = factor(model, levels = c("Decrease trend imposed", "AR1 w/ linear structure", "B-spline")))
+  
+  
+  
 plt.wane.mv.nir.compareMods.vaxatbirth <- ggplot() +
   # -- background:  CI ribbon, very low alpha --
   geom_ribbon(data = ve.vaxatbirth %>% 
@@ -3593,7 +3612,7 @@ plt.wane.mv.nir.compareMods.vaxatbirth.main <- ggplot() +
   #   hjust = 1, size = 3, fontface = "bold",
   #   inherit.aes = FALSE, show.legend = FALSE
   # ) +
-  facet_grid(~ model) +
+  # facet_grid(~ model) +
   guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1)),
          fill  = "none") +
   theme_bw(base_size = 13) +
@@ -3611,18 +3630,64 @@ ve.vaxatbirth %>% filter(model == "Decrease trend imposed") %>% filter(product =
 ```
 
 
-
-
 ```{r}
 # save the waning curve for later estiamtion of duration from Mat
-# saveRDS(ve, "fit_durMat/data/ve_wane_sep_mv_nir.rds")
+# saveRDS(ve.vaxatbirth, "fit_durMat/data/ve_wane_sep_mv_nir.rds")
 ```
+
+
+#### Based on Carlos' suggestion on the waning VE section in the manuscript: Over the first 6 months of life, modeled effectiveness declined by approximately 6.6 percentage points per month for maternal RSVpreF vaccination versus 3.7 percentage points per month for nirsevimab, corresponding to an approximately 1.8-fold faster rate of waning with maternal vaccination." the numbers are just eye balling it from the figure, but i think the model should be able to give you this. I think this would help because the ratio of decline is very consistent with known decay of mAb and transplacental Ab, so it works well with the discussion below.
+```{r}
+# read in the waning posterior outputs from the main model (decrease model)
+nir.samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_decrease_nir_infection.rds")
+mat.samples <- readRDS("../data/posterior/wane_mv_agemodi/wane_decrease_mat_infection.rds")
+
+post1 <- as.data.frame(as.matrix(nir.samples[[1]]))  
+post2 <- as.data.frame(as.matrix(nir.samples[[2]])) 
+post3 <- as.data.frame(as.matrix(nir.samples[[3]])) 
+nir.post <- bind_rows(post1, post2, post3)
+
+post1 <- as.data.frame(as.matrix(mat.samples[[1]]))  
+post2 <- as.data.frame(as.matrix(mat.samples[[2]])) 
+post3 <- as.data.frame(as.matrix(mat.samples[[3]])) 
+mat.post <- bind_rows(post1, post2, post3)
+
+nir.monthly.decrease <- c()
+mat.monthly.decrease <- c()
+ratio.monthly.decrease <- c()
+
+# function to calculate the percentage decrease per month in the first 6 months
+for(i in 1:nrow(nir.post)){
+  nir.beta1 <- nir.post$`beta[1]`[i]
+  nir.beta6 <- nir.post$`beta[6]`[i]
+  nir.d <- ((1-exp(nir.beta1)) - (1-exp(nir.beta6))) / 5
+  
+  mat.beta1 <- mat.post$`beta[1]`[i]
+  mat.beta6 <- mat.post$`beta[6]`[i]
+  mat.d <- ((1-exp(mat.beta1)) - (1-exp(mat.beta6))) / 5
+  
+  ratio.d <- mat.d / nir.d
+  
+  nir.monthly.decrease[i] <- nir.d
+  mat.monthly.decrease[i] <- mat.d
+  ratio.monthly.decrease[i] <- ratio.d
+}
+
+
+# summarize 
+quantile(nir.monthly.decrease, c(0.025, 0.5, 0.975)) # 3.6% (1.4, 7.4)
+quantile(mat.monthly.decrease, c(0.025, 0.5, 0.975)) # 6.2% (2.3, 13.2)
+quantile(ratio.monthly.decrease, c(0.025, 0.5, 0.975)) # 1.74 (0.52, 5.74) fold faster waning in RSVpreF 
+```
+
+
+
+
 
 ```{r eval = F}
 tocheck_id <- c("7292256", "7281450", "8656445", "8596605", "8593232", "7327659", "7293770", "7278498", "8624694", "7286222", "8080806", "8607406", "7308410", "7266822", "7299028", "8493240", "8485822", "7350074")
 df %>% filter(babystudyid %in%  tocheck_id) %>% dplyr::select(babystudyid, babydob, abrysvo_date) %>% distinct()
 df %>% filter(babystudyid == "7350074") %>% dplyr::select(babystudyid, babydob, abrysvo_date) %>% distinct()
-
 ```
 
 
