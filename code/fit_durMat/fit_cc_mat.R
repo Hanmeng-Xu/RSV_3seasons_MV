@@ -11,7 +11,7 @@ source("code/fit_durMat/model_cc_mat.R")
 
 
 # -------------------------------------------------------------------------------
-tofitSES <- "unstratified" # using transmission parameters from "unstratified", "low", "medium", "high"
+tofitSES <- "medium" # using transmission parameters from "unstratified", "low", "medium", "high"
 # -------------------------------------------------------------------------------
 
 if(tofitSES == "unstratified"){
@@ -253,11 +253,14 @@ for (t in 1:tmax) {
 inc_immu = matrix(0, nrow = tmax, ncol = al) 
 inc_unimmu = matrix(0, nrow = tmax, ncol = al) 
 for(i in 1:al){
-  inc_immu[, i] =  lambda1[,i] * SV0[,i] +  
+  inc_immu[, i] =  
+    lambda1[,i] * SVmat[,i] * RR.median +
+    lambda1[,i] * SV0[,i] +  
     lambda1[,i] * (SV1[,i] + WV1[,i]) * sigma1 +
     lambda1[,i] * (SV2[,i] + WV2[,i]) * sigma2 +
     lambda1[,i] * (SV3[,i] + WV3[,i]) * sigma3 
-  inc_unimmu[, i] =  lambda1[,i] * SU0[,i] +  
+  inc_unimmu[, i] =  
+    lambda1[,i] * SU0[,i] +  
     lambda1[,i] * (SU1[,i] + WU1[,i]) * sigma1 +
     lambda1[,i] * (SU2[,i] + WU2[,i]) * sigma2 +
     lambda1[,i] * (SU3[,i] + WU3[,i]) * sigma3 
@@ -274,8 +277,8 @@ plot(VE[(509 + 1):(520 + 1)], type = "l") # lagged 4 months (to account for the 
 # fit to the case control data  
 # ------------------------------------------------------------------------------
 # model_cc <- "Decrease trend imposed" # decrease model has the lowest DIC
-# model_cc <- "B-spline"
-model_cc <- "AR1 w/ linear structure"
+model_cc <- "B-spline"
+
 
 ve.cc <- readRDS("code/fit_durMat/data/ve_wane_sep_mv_nir.rds") %>% # filter(endpoint == "MA RSV infection") %>% 
   mutate(VE_median = VE_median / 100, 
@@ -301,7 +304,7 @@ run_model_VE <- function(dur_mat) {
   parms.test <- c(
     parmset, 
     list(
-      RR = c(rep(1, 504), rep( (1-ve.cc$VE_median[1]) , (tmax-504))),  # 0.38 is 1-VE_1stmonth of decrease model (relative risk for vaxed infants)
+      RR = c(rep(1, 504), rep( RR.median , (tmax-504))),  
       rrM = c(rep(1, 504), rep(rrM.median, (tmax-504))), 
       baseline.txn.rate = beta.median,
       b1 = b1.median,
@@ -353,6 +356,10 @@ run_model_VE <- function(dur_mat) {
   WU2 <- results[, grep(' WU2', colnames(results))]
   WU3 <- results[, grep(' WU3', colnames(results))]
   
+  MVmat <- results[,grep(' MVmat', colnames(results))]
+  SVmat <- results[,grep(' SVmat', colnames(results))]
+  Vmat <-  results[,grep(' Vmat', colnames(results))]
+  
   # ── Force of infection ─────────────────────────────────────────────────────
   beta    <- parms.test$baseline.txn.rate / (parms.test$dur.days1 / 30.44) * parms.test$c2
   lambda1 <- matrix(0, nrow = tmax, ncol = N_ages)
@@ -372,21 +379,23 @@ run_model_VE <- function(dur_mat) {
   inc_unimmu <- matrix(0, nrow = tmax, ncol = al)
   
   for (i in 1:al) {
-    inc_immu[, i] <- lambda1[, i] * SV0[, i] +
-      lambda1[, i] * (SV1[, i] + WV1[, i]) * sigma1 +
-      lambda1[, i] * (SV2[, i] + WV2[, i]) * sigma2 +
-      lambda1[, i] * (SV3[, i] + WV3[, i]) * sigma3
-    
-    inc_unimmu[, i] <- lambda1[, i] * SU0[, i] +
-      lambda1[, i] * (SU1[, i] + WU1[, i]) * sigma1 +
-      lambda1[, i] * (SU2[, i] + WU2[, i]) * sigma2 +
-      lambda1[, i] * (SU3[, i] + WU3[, i]) * sigma3
+    inc_immu[, i] =  
+      lambda1[,i] * SVmat[,i] * RR.median +
+      lambda1[,i] * SV0[,i] +  
+      lambda1[,i] * (SV1[,i] + WV1[,i]) * sigma1 +
+      lambda1[,i] * (SV2[,i] + WV2[,i]) * sigma2 +
+      lambda1[,i] * (SV3[,i] + WV3[,i]) * sigma3
+    inc_unimmu[, i] =  
+      lambda1[,i] * SU0[,i] +  
+      lambda1[,i] * (SU1[,i] + WU1[,i]) * sigma1 +
+      lambda1[,i] * (SU2[,i] + WU2[,i]) * sigma2 +
+      lambda1[,i] * (SU3[,i] + WU3[,i]) * sigma3
   }
   
-  VE <- 1 - rowSums(inc_immu[,1:6]) / rowSums(inc_unimmu[,1:6]) # VE among infants under 12 months
+  VE <- 1 - rowSums(inc_immu[,1:6]) / rowSums(inc_unimmu[,1:6]) # only look at infant age groups 
   
   # Return only the 16-month post-vaccination window (Oct 2023 = timestep 509)
-  month_idx <- 508 + 1 + (1:6) # "+ 1": time lag between vax to delivery
+  month_idx <- 508 + 1 + 2 + (1:6) # "+ 1": time lag between vax to delivery # "+ 2": from month 3 of the waning curve (as the first 2 months is having increasing trend in spline model)
   return(VE[month_idx])
 }
 
@@ -395,7 +404,7 @@ run_model_VE <- function(dur_mat) {
 sse_objective <- function(log_dur_mat) { # sum of squared errors
   dur_mat  <- exp(log_dur_mat)
   VE_model <- run_model_VE(dur_mat)
-  sse      <- sum((VE_model - ve.cc$VE_median[1:6])^2, na.rm = TRUE)
+  sse      <- sum((VE_model - ve.cc$VE_median[3:8])^2, na.rm = TRUE) ## start fitting from month 3
   cat(sprintf("  dur_mat=%.1f  SSE=%.6f\n", dur_mat, sse))
   return(sse)
 }
@@ -416,7 +425,7 @@ opt <- optim(
 # profile sampling to estimate uncertainty of dur_mat
 # ------------------------------------------------------------------------------
 # 0. Observed target + cached model evaluations ─────────────────────────────
-ve_obs <- ve.cc %>% arrange(month) %>% slice(1:6) %>% pull(VE_median)
+ve_obs <- ve.cc %>% arrange(month) %>% slice(3:8) %>% pull(VE_median) ## start fitting from month 3
 stopifnot(length(ve_obs) == 6, all(!is.na(ve_obs)))
 n <- sum(!is.na(ve_obs))
 
@@ -566,6 +575,8 @@ plt.durMat.byses <-
   theme_bw(base_size = 12) +
   theme(legend.position = "none")
 
+plt.durMat.byses
+
 # ggsave(plt.durMat.byses, filename = "code/fit_durMat/data/durMat_bySES.pdf", width =6, height = 4)
 
 # remove unstratified ses 
@@ -589,6 +600,8 @@ plt.durMat.byses.rmunstra <-
   ) +
   theme_bw(base_size = 12) +
   theme(legend.position = "none")
+
+plt.durMat.byses.rmunstra
 
 # ggsave(plt.durMat.byses.rmunstra, filename = "code/fit_durMat/data/durMat_bySES_rmunstra.pdf", width =6, height = 4)
 
