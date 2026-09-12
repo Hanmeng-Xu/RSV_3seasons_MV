@@ -30,6 +30,21 @@ plot(df.epic$epic_pct_rsv, type = "l")
 
 
 
+# df.epic <- vroom("data/external_rsv_activity/weekly.csv.gz") %>% filter(geography == "00") %>% # natioanl 
+#   filter(age == "1-4 Years" | age == "<1 Years" ) %>%
+#   mutate(collection_week = floor_date(time, "week"))
+# 
+# plt.epic.trend <- df.epic |>
+#   filter(time > as.Date("2020-10-01")) |>
+#   ggplot(aes(x = time, y = epic_pct_rsv, color = age, group = age)) +
+#   geom_line() +
+#   scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+#   labs(x = NULL, y = "RSV (% of ED encounters)") +
+#   theme_bw() +
+#   theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1))
+
+
+
 # calculate the log form
 df.epic <- df.epic %>% 
   mutate(log_positivity_ext = log(epic_pct_rsv + 0.01)) %>%

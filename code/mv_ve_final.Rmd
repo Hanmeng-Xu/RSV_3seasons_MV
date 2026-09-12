@@ -219,6 +219,29 @@ df.mv %>% filter(babystudyid == "7362662") %>% dplyr::select(collection_date, po
 ```
 
 
+### (manuscript table) because we changed from "having at least risk factor" (which includes preterm and low birth weight) to "medical comorbidities" (removed the two)
+Current definition for "medical comorbidities" used in table 1 is: Have at least 1 of the following conditions recorded in the infant’s medical history or diagnosis records: (1) asthma, (2) immunodeficiency (e.g., transplantation history or leukemia), (3) cardiac diseases (including congenital heart diseases diagnosed at birth or any reporting of heart conditions), (4) pulmonary diseases, (5) Down syndrome. 
+
+```{r}
+df.mv %>% count(rf_asthma)
+df.mv %>% count(rf_immudefi)
+df.mv %>% count(rf_cardiac)
+df.mv %>% count(rf_lung)
+df.mv %>% count(rf_down)
+
+df.mv %>% count(rf_preterm)
+
+df.mv <- df.mv %>%
+  mutate(rf_medcomorb = if_else(
+    rowSums(across(c(rf_asthma, rf_immudefi, rf_cardiac, rf_lung, rf_down)),
+            na.rm = TRUE) > 0,
+    1, 0
+  ))
+
+df.mv %>% count(rf_medcomorb)
+```
+
+
 
 
 #### classify the exposure 
@@ -258,7 +281,13 @@ df.mv %>% count(exp_mv_mab_unstrat, positive_rsv)
 
 ```
 
-
+### (manuscript) check: as we used a broader definition, check if there are infants' mother vaccinated <7 days before RSV test 
+```{r}
+df.mv %>% filter(abrysvo_vaccinated_for_current_delivery == 1) %>%
+  mutate(d = as.numeric(collection_date - abrysvo_date)) %>% 
+  dplyr::select(d, abrysvo_to_dob) %>%
+  arrange((d))
+```
 
 
 ### for numbers in the participants flowchart
@@ -356,7 +385,8 @@ df.table1.casecontrol <- df.mv %>%
                 month_tested_factor_2m,
                 gestage, birthwt, insurance_type, 
                 hosp_admitted_relevant, icu_admitted_relevant, 
-                rf_preterm, rf_cardiac, rf_atleastone, 
+                rf_preterm, rf_cardiac, # rf_atleastone, 
+                rf_medcomorb,
                 # nir_vaccinated_bf_test, 
                 # abrysvo_vaccinated_for_current_delivery
                 exp_mv_mab_unstrat
@@ -371,7 +401,7 @@ df.table1.casecontrol <- df.mv %>%
 
 # footnotes 
 footnote_otherraces <- "Including American Indian or Native American, Asian, Middle Eastern or Northern African, and Pacific Islander by self-reporting."
-footnote_atleastoneriskfactor <- "Have at least 1 of the following conditions recorded in the infant’s medical history or diagnosis records: (1) asthma, (2) immunodeficiency (e.g., transplantation history or leukemia), (3) cardiac diseases (including congenital heart diseases diagnosed at birth or any reporting of heart conditions), (4) pulmonary diseases, (5) Down syndrome, (6) birth weight <2,500 g, and (7) prematurity (gestational age <37 weeks)."
+footnote_atleastoneriskfactor <- "Have at least 1 of the following conditions recorded in the infant’s medical history or diagnosis records: (1) asthma, (2) immunodeficiency (e.g., transplantation history or leukemia), (3) cardiac diseases (including congenital heart diseases diagnosed at birth or any reporting of heart conditions), (4) pulmonary diseases, (5) Down syndrome." # , (6) birth weight <2,500 g, and (7) prematurity (gestational age <37 weeks)."
 
 
 table1.casecontrol <- df.table1.casecontrol  %>% 
@@ -400,7 +430,7 @@ table1.casecontrol <- df.table1.casecontrol  %>%
                 icu_admitted_relevant ~ "Admitted to PICU",
                 rf_preterm ~ "Preterm",
                 rf_cardiac ~ "Cardiac diseases", 
-                rf_atleastone ~ "Having at least one risk factor",
+                rf_medcomorb ~ "Medical comorbidities",
                 
                 # nir_vaccinated_bf_test ~ "Nirsevimab immunized",
                 # abrysvo_vaccinated_for_current_delivery ~ "Mom received abrysvo"
@@ -450,7 +480,8 @@ df.table1.vaxtype <- df.mv %>%
                 month_tested_factor_2m,
                 gestage, birthwt, insurance_type, 
                 hosp_admitted_relevant, icu_admitted_relevant, 
-                rf_preterm, rf_cardiac, rf_atleastone, 
+                rf_preterm, rf_cardiac, # rf_atleastone, 
+                rf_medcomorb,
                 # nir_vaccinated_bf_test, 
                 # abrysvo_vaccinated_for_current_delivery
                 exp_mv_mab_unstrat
@@ -486,7 +517,7 @@ table1.vaxtype <- df.table1.vaxtype  %>%
                 icu_admitted_relevant ~ "Admitted to PICU",
                 rf_preterm ~ "Preterm",
                 rf_cardiac ~ "Cardiac diseases", 
-                rf_atleastone ~ "Having at least one risk factor"
+                rf_medcomorb ~ "Medical comorbidities"
                 # nir_vaccinated_bf_test ~ "Nirsevimab immunized",
                 # abrysvo_vaccinated_for_current_delivery ~ "Mom received abrysvo"
                
@@ -535,7 +566,8 @@ if(savenewplot){
 cf.mv <- c("age_at_test_in_months", # continuous (although exposure has been stratified by age)
            "month_tested_factor",
             "log_positivity_ext_c",  # adjusting for this widern CI and lower the point estimates
-            "rf_atleastone",
+            # "rf_atleastone",
+            "rf_medcomorb",
             "birthwt",  # unbalanced btw cases and controls
             "gestage"
             # "rf_cardiac" # unbalanced btw cases and controls

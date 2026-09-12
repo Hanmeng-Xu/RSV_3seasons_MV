@@ -52,16 +52,16 @@ df.lit <- df.lit %>% filter(studyid != "Current study" |
                               (studyid == "Current study" & note_2 == "relaxed definition"))
 
 # select the data to show for Williams et al, 2025 (use their primary outcome using the 14 days exposure definition)
-df.lit <- df.lit %>% filter(studyid != "Williams et al, 2025" | 
-                              (studyid == "Williams et al, 2025" & note_2 == "select"))
+df.lit <- df.lit %>% filter(studyid != "Williams et al, 2025 [3]" | 
+                              (studyid == "Williams et al, 2025 [3]" & note_2 == "select"))
 
 # select data to show for Kampmann et al. 2023 (keep only age group under 3 and under 6, removing under 4/5)
-df.lit <- df.lit %>% filter(studyid != "Kampmann et al. 2023" | 
-                              (studyid == "Kampmann et al. 2023" & note_2 == "select"))
+df.lit <- df.lit %>% filter(studyid != "Kampmann et al. 2023 [2]" | 
+                              (studyid == "Kampmann et al. 2023 [2]" & note_2 == "select"))
 
 # remove the VE in McLachlan et al. 2025 for preterm infants
-df.lit <- df.lit %>% filter(studyid != "McLachlan et al. 2025" | 
-                              (studyid == "McLachlan et al. 2025" & note_2 == "select"))
+df.lit <- df.lit %>% filter(studyid != "McLachlan et al. 2025 [4]" | 
+                              (studyid == "McLachlan et al. 2025 [4]" & note_2 == "select"))
 
 
 
@@ -87,7 +87,8 @@ df.lit <- df.lit %>%
   mutate(outcome_cat = case_when(outcome %in% c("RSV-associated LRTI",
                                                 "MA RSV LRTI",
                                                 "RSV-associated RTI",
-                                                "RSV-associated ARI") ~ "MA RSV infection",
+                                                "RSV-associated ARI",
+                                                "RSV illness") ~ "MA RSV infection",
                                  outcome %in% c("RSV-associated severe LRTI", 
                                                 "MA severe RSV LRTI",
                                                 "RSV-associated ALRI requiring high-flow nasal cannula support") ~ "severe MA RSV infection",
@@ -198,7 +199,7 @@ plt.mv.ve.lit.infection.hosp <-
   plot_grid(plt.ve.lit.infection, 
             plt.ve.lit.hosp,
             ncol = 1, 
-            rel_heights = c(6,  9),
+            rel_heights = c(6,  8),
             labels = c("A)", "B)")
           )
 
